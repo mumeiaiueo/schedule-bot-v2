@@ -1,16 +1,18 @@
 import os
+import asyncio
 import discord
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+TOKEN = os.getenv("DISCORD_TOKEN")  # Renderの環境変数名に合わせて
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 
 @client.event
 async def on_ready():
-    print(f"✅ Logged in as {client.user} ({client.user.id})")
+    print(f"✅ Logged in as {client.user} (id={client.user.id})")
 
-if __name__ == "__main__":
-    if not TOKEN:
-        raise RuntimeError("DISCORD_TOKEN が未設定です")
-    client.run(TOKEN)
+async def main():
+    await asyncio.sleep(10)  # ←これが429予防の保険
+    await client.start(TOKEN)
+
+asyncio.run(main())
