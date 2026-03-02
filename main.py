@@ -197,35 +197,45 @@ async def generate(interaction: discord.Interaction):
     start = now.replace(minute=minute, second=0, microsecond=0)
     end = start + timedelta(hours=2)
 
-# 3) slots に insert
+    # 3) slots を作る（slot_time は NOT NULL なので必ず入れる）
     slot_rows = []
     cur = start
     while cur < end:
+        st_utc = cur.astimezone(timezone.utc).isoformat()
+        en_utc = (cur + timedelta(minutes=interval)).astimezone(timezone.utc).isoformat()
+
         slot_rows.append({
-        ...
+            "panel_id": panel_id,
+            "start_at": st_utc,
+            "end_at": en_utc,
+            "slot_time": cur.strftime("%H:%M"),  # ← 必須
+            "is_break": False,                  # ← NOT NULL なら入れる
+            "notified": False,                  # ← NOT NULL なら入れる
+            "reserved_by": None                 # 予約者（使ってる列に合わせる）
+            # ほかに列があっても nullable なら入れなくてOK
         })
         cur += timedelta(minutes=interval)
 
-# ★ ここに追加
+    # ★ 重複回避：先にこの panel の slots を全部消す
     try:
         await db_to_thread(lambda: delete_slots(panel_id))
     except Exception as e:
         await interaction.followup.send(f"❌ slots削除失敗: {e}", ephemeral=True)
         return
 
-# ここは元のまま
+    # 4) slots insert
     try:
         ins = await db_to_thread(lambda: insert_slots(slot_rows))
-        except Exception as e:
-            await interaction.followup.send(f"❌ slots 作成失敗: {e}", ephemeral=True)
-            return
+    except Exception as e:
+        await interaction.followup.send(f"❌ slots 作成失敗: {e}", ephemeral=True)
+        return
 
     created = ins.data or []
     if not created:
         await interaction.followup.send("❌ slots が作れなかった（slots の列が足りない可能性）", ephemeral=True)
         return
 
-    # 4) パネル投稿
+    # 5) パネル投稿（枠ボタン）
     ch = interaction.guild.get_channel(int(notify_channel_id)) or interaction.channel
     msg = await ch.send(f"📅 **{title}**\n下のボタンで予約してね👇", view=SlotsView(created))
 
