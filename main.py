@@ -202,8 +202,17 @@ async def generate(interaction: discord.Interaction):
     "panel_id": panel_id,
     "start_at": cur.astimezone(timezone.utc).isoformat(),
     "end_at": (cur + timedelta(minutes=interval)).astimezone(timezone.utc).isoformat(),
-    "slot_time": cur.astimezone(JST).strftime("%H:%M"),
-    "reserved_by": None
+
+    # ★ 必須
+    "slot_time": cur.strftime("%H:%M"),
+    "is_break": False,
+    "notified": False,
+
+    # 任意
+    "reserved_by": None,
+    "reserver_user_id": None,
+    "reserver_name": None,
+    "reserved_at": None
 })
         cur += timedelta(minutes=interval)
 
