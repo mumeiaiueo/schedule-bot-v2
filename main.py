@@ -1,11 +1,16 @@
 import os
 import discord
 
+TOKEN = os.getenv("DISCORD_TOKEN")
+
 intents = discord.Intents.default()
-bot = discord.Client(intents=intents)
+client = discord.Client(intents=intents)
 
-@bot.event
+@client.event
 async def on_ready():
-    print("✅ Logged in as", bot.user)
+    print(f"✅ Logged in as {client.user} ({client.user.id})")
 
-bot.run(os.getenv("DISCORD_TOKEN"))
+if __name__ == "__main__":
+    if not TOKEN:
+        raise RuntimeError("DISCORD_TOKEN が未設定です")
+    client.run(TOKEN)
