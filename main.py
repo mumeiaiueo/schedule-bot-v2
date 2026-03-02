@@ -231,41 +231,41 @@ class SetupStep1View(discord.ui.View):
 # select callbackをまとめて拾うためのグローバルハンドラ
 @client.event
 async def on_interaction(interaction: discord.Interaction):
-    # 通常処理はdiscord.pyがやるので、ここでは Select値の反映だけ
+    # ✅ 1) まず自前処理（setupのSelect反映だけ）
     try:
-        if interaction.type != discord.InteractionType.component:
-            return
-        cid = interaction.data.get("custom_id")  # type: ignore
-        if not cid or not cid.startswith("setup:"):
-            return
-        key = dkey(interaction)
-        if key not in draft:
-            return
+        if interaction.type == discord.InteractionType.component:
+            data = interaction.data or {}
+            cid = data.get("custom_id", "")
 
-        st = draft[key]
-        # Select系
-        if cid in ("setup:start_h","setup:start_m","setup:end_h","setup:end_m","setup:interval_select"):
-            val = interaction.data["values"][0]  # type: ignore
-            if cid == "setup:start_h":
-                st["start_h"] = int(val)
-            elif cid == "setup:start_m":
-                st["start_m"] = int(val)
-            elif cid == "setup:end_h":
-                st["end_h"] = int(val)
-            elif cid == "setup:end_m":
-                st["end_m"] = int(val)
-            elif cid == "setup:interval_select":
-                st["interval"] = int(val)
+            if cid.startswith("setup:"):
+                key = dkey(interaction)
+                st = draft.get(key)
 
-            # いま表示中のStepに応じてembed更新
-            # （Step番号は st["step"] で管理）
-            if st.get("step") == 1:
-                await interaction.response.edit_message(embed=build_setup_embed_step1(st), view=interaction.message.components)  # type: ignore
-            else:
-                await interaction.response.edit_message(embed=build_setup_embed_step2(st), view=interaction.message.components)  # type: ignore
+                # 状態が無いなら無視して通常処理へ
+                if st and "values" in data and data["values"]:
+                    val = data["values"][0]
+
+                    if cid == "setup:start_h":
+                        st["start_h"] = int(val)
+                    elif cid == "setup:start_m":
+                        st["start_m"] = int(val)
+                    elif cid == "setup:end_h":
+                        st["end_h"] = int(val)
+                    elif cid == "setup:end_m":
+                        st["end_m"] = int(val)
+                    elif cid == "setup:interval_select":
+                        st["interval"] = int(val)
+
+                    # ✅ embed + view を “ちゃんとViewで” 更新
+                    embed = build_setup_embed_step1(st) if st.get("step", 1) == 1 else build_setup_embed_step2(st)
+                    await interaction.response.edit_message(embed=embed, view=SetupView(st))
+                    return
     except Exception:
-        # ここは失敗しても致命じゃないので握る（UI更新できないだけ）
-        return
+        # UI更新に失敗しても、通常処理は通す
+        pass
+
+    # ✅ 2) ここが超重要：通常処理をdiscord.pyに渡す
+    await tree.process_interaction(interaction)
 
 # ========= Step2 View =========
 class SetupStep2View(discord.ui.View):
