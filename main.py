@@ -198,27 +198,27 @@ async def generate(interaction: discord.Interaction):
     end = start + timedelta(hours=2)
 
 # 3) slots に insert
-slot_rows = []
-cur = start
-while cur < end:
-    slot_rows.append({
+    slot_rows = []
+    cur = start
+    while cur < end:
+        slot_rows.append({
         ...
-    })
-    cur += timedelta(minutes=interval)
+        })
+        cur += timedelta(minutes=interval)
 
 # ★ ここに追加
-try:
-    await db_to_thread(lambda: delete_slots(panel_id))
-except Exception as e:
-    await interaction.followup.send(f"❌ slots削除失敗: {e}", ephemeral=True)
-    return
+    try:
+        await db_to_thread(lambda: delete_slots(panel_id))
+    except Exception as e:
+        await interaction.followup.send(f"❌ slots削除失敗: {e}", ephemeral=True)
+        return
 
 # ここは元のまま
-try:
-    ins = await db_to_thread(lambda: insert_slots(slot_rows))
-    except Exception as e:
-        await interaction.followup.send(f"❌ slots 作成失敗: {e}", ephemeral=True)
-        return
+    try:
+        ins = await db_to_thread(lambda: insert_slots(slot_rows))
+        except Exception as e:
+            await interaction.followup.send(f"❌ slots 作成失敗: {e}", ephemeral=True)
+            return
 
     created = ins.data or []
     if not created:
