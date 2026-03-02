@@ -197,30 +197,25 @@ async def generate(interaction: discord.Interaction):
     start = now.replace(minute=minute, second=0, microsecond=0)
     end = start + timedelta(hours=2)
 
-    # 3) slots insert
-    slot_rows = []
-    cur = start
-    while cur < end:
-        slot_rows.append({
-    "panel_id": panel_id,
-    "start_at": cur.astimezone(timezone.utc).isoformat(),
-    "end_at": (cur + timedelta(minutes=interval)).astimezone(timezone.utc).isoformat(),
+# 3) slots に insert
+slot_rows = []
+cur = start
+while cur < end:
+    slot_rows.append({
+        ...
+    })
+    cur += timedelta(minutes=interval)
 
-    # ★ 必須
-    "slot_time": cur.strftime("%H:%M"),
-    "is_break": False,
-    "notified": False,
+# ★ ここに追加
+try:
+    await db_to_thread(lambda: delete_slots(panel_id))
+except Exception as e:
+    await interaction.followup.send(f"❌ slots削除失敗: {e}", ephemeral=True)
+    return
 
-    # 任意
-    "reserved_by": None,
-    "reserver_user_id": None,
-    "reserver_name": None,
-    "reserved_at": None
-})
-        cur += timedelta(minutes=interval)
-
-    try:
-        ins = await db_to_thread(lambda: insert_slots(slot_rows))
+# ここは元のまま
+try:
+    ins = await db_to_thread(lambda: insert_slots(slot_rows))
     except Exception as e:
         await interaction.followup.send(f"❌ slots 作成失敗: {e}", ephemeral=True)
         return
