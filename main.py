@@ -199,11 +199,12 @@ async def generate(interaction: discord.Interaction):
     cur = start
     while cur < end:
         slot_rows.append({
-            "panel_id": panel_id,
-            "start_at": cur.astimezone(timezone.utc).isoformat(),
-            "end_at": (cur + timedelta(minutes=interval)).astimezone(timezone.utc).isoformat(),
-            "reserved_by": None
-        })
+    "panel_id": panel_id,
+    "start_at": cur.astimezone(timezone.utc).isoformat(),
+    "end_at": (cur + timedelta(minutes=interval)).astimezone(timezone.utc).isoformat(),
+    "slot_time": cur.astimezone(JST).strftime("%H:%M"),
+    "reserved_by": None
+})
         cur += timedelta(minutes=interval)
 
     try:
