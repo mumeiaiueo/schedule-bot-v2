@@ -4,342 +4,267 @@ from datetime import datetime, timedelta, timezone
 
 import discord
 from discord import app_commands
-from dotenv import load_dotenv
+from supabase import create_client
 
-from db import init_supabase, db_to_thread
-from views.setup_view import build_setup_view, build_setup_embed
-from views.setup_view import TitleModal
-from views.slots_view import SlotsView
-
-load_dotenv()
-
+# ========= env =========
 TOKEN = os.getenv("DISCORD_TOKEN")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN が未設定です")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("SUPABASE_URL / SUPABASE_KEY が未設定です")
+
+sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 JST = timezone(timedelta(hours=9))
-UTC = timezone.utc
 
-# ===== 起動時にSupabase初期化 =====
-sb = init_supabase()
-
-# ===== discord =====
+# ========= discord =========
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-# ====== ウィザード状態（ユーザーごと） ======
-wizard_state: dict[int, dict] = {}
+# ---- 状態（作成中の一時保存）----
+draft = {}  # key: (guild_id, user_id) -> dict
 
-def ensure_state(user_id: int) -> dict:
-    st = wizard_state.get(user_id)
-    if not isinstance(st, dict):
-        st = {
-            "step": 1,
-            "day": "today",  # today / tomorrow
-            "start_hour": None,
-            "start_min": None,
-            "end_hour": None,
-            "end_min": None,
-            "interval": None,  # "20"/"25"/"30"
-            "title": "",
-            "mention_everyone": False,
-            "notify_channel_id": None,  # int
-        }
-        wizard_state[user_id] = st
-    return st
+def dkey(interaction: discord.Interaction):
+    return (str(interaction.guild_id), str(interaction.user.id))
 
-def hm_to_minutes(hm: str) -> int:
-    h, m = hm.split(":")
-    return int(h) * 60 + int(m)
+async def db_to_thread(fn):
+    return await asyncio.to_thread(fn)
 
-def get_hm(st: dict, key_h: str, key_m: str):
-    if st.get(key_h) is None or st.get(key_m) is None:
-        return None
-    return f"{int(st[key_h]):02d}:{int(st[key_m]):02d}"
-
-def day_key_to_date(day_key: str) -> datetime.date:
-    now = datetime.now(JST)
-    if day_key == "tomorrow":
-        return (now + timedelta(days=1)).date()
-    return now.date()
-
-def build_range_jst(day_date, sh, sm, eh, em):
-    start = datetime(day_date.year, day_date.month, day_date.day, sh, sm, tzinfo=JST)
-
-    # 24:00対応（終了が 24:00 のとき）
-    if eh == 24 and em == 0:
-        end = datetime(day_date.year, day_date.month, day_date.day, 0, 0, tzinfo=JST) + timedelta(days=1)
-        return start, end
-
-    end = datetime(day_date.year, day_date.month, day_date.day, eh, em, tzinfo=JST)
-
-    # 日跨ぎ（例 23:00 -> 01:00）
-    if end <= start:
-        end = end + timedelta(days=1)
-
-    return start, end
-
-def slot_time_label(dt_utc: datetime) -> str:
-    return dt_utc.astimezone(JST).strftime("%H:%M")
-
-# ===== DB helpers =====
+# ========= DB helpers =========
 def upsert_panel(row: dict):
     return sb.table("panels").upsert(row, on_conflict="guild_id,day_key").execute()
 
-def get_panel(guild_id: str, day_key: str):
-    return (
-        sb.table("panels")
-        .select("*")
-        .eq("guild_id", guild_id)
-        .eq("day_key", day_key)
-        .limit(1)
-        .execute()
-    )
+# ========= UI helpers =========
+def hour_options():
+    return [discord.SelectOption(label=f"{h:02d}", value=f"{h:02d}") for h in range(24)]  # 24
 
-def delete_slots(panel_id: int):
-    return sb.table("slots").delete().eq("panel_id", panel_id).execute()
+def minute_options(step=5):
+    return [discord.SelectOption(label=f"{m:02d}", value=f"{m:02d}") for m in range(0, 60, step)]  # 12
 
-def insert_slots(rows: list[dict]):
-    return sb.table("slots").insert(rows).execute()
+def interval_options():
+    return [
+        discord.SelectOption(label="20分", value="20"),
+        discord.SelectOption(label="25分", value="25"),
+        discord.SelectOption(label="30分", value="30"),
+    ]
 
-def update_panel_message_id(panel_id: int, message_id: str):
-    return sb.table("panels").update({"panel_message_id": message_id}).eq("id", panel_id).execute()
+def hm_from_state(st: dict, prefix: str):
+    h = st.get(f"{prefix}_h")
+    m = st.get(f"{prefix}_m")
+    if h is None or m is None:
+        return None
+    return f"{int(h):02d}:{int(m):02d}"
 
-def delete_panel(guild_id: str, day_key: str):
-    return sb.table("panels").delete().eq("guild_id", guild_id).eq("day_key", day_key).execute()
+def build_setup_embed(st: dict):
+    e = discord.Embed(title="募集パネル作成", color=0x5865F2)
 
-# ===== /setup =====
-@tree.command(name="setup", description="募集パネル作成ウィザードを開く")
-async def setup_cmd(interaction: discord.Interaction):
-    st = ensure_state(interaction.user.id)
-    st["step"] = 1  # 最初に戻す
+    day = st.get("day_key", "today")
+    e.add_field(name="日付", value=("今日" if day == "today" else "明日"), inline=True)
 
-    await interaction.response.send_message(
-        embed=build_setup_embed(st),
-        view=build_setup_view(st),
-        ephemeral=False
-    )
+    start = hm_from_state(st, "start")
+    end = hm_from_state(st, "end")
+    e.add_field(name="開始", value=(start or "未選択"), inline=True)
+    e.add_field(name="終了", value=(end or "未選択"), inline=True)
 
-# ===== /generate =====
-@tree.command(name="generate", description="設定済みの内容で枠ボタンを生成して投稿")
-async def generate_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    interval = st.get("interval_minutes")
+    e.add_field(name="間隔", value=(f"{interval}分" if interval else "未選択"), inline=True)
 
-    guild_id = str(interaction.guild_id)
-    # day_key は今は今日固定（必要なら tomorrow も対応できる）
-    day_key = "today"
+    title = st.get("title") or "無題"
+    e.add_field(name="タイトル", value=title, inline=False)
 
-    # panel 取得
-    pres = await db_to_thread(lambda: get_panel(guild_id, day_key))
-    if not pres.data:
-        await interaction.followup.send("❌ 先に /setup → 保存 してね", ephemeral=True)
-        return
+    notify = st.get("notify_channel_id")
+    e.add_field(name="通知チャンネル", value=(f"<#{notify}>" if notify else "このチャンネル"), inline=False)
 
-    panel = pres.data[0]
-    panel_id = int(panel["id"])
+    everyone = bool(st.get("mention_everyone", False))
+    e.add_field(name="@everyone", value=("ON" if everyone else "OFF"), inline=True)
 
-    title = panel.get("title") or "無題"
-    interval = int(panel.get("interval_minutes") or 30)
-    notify_channel_id = panel.get("notify_channel_id") or str(interaction.channel_id)
-    mention_everyone = bool(panel.get("mention_everyone", False))
+    e.set_footer(text="全部選んだら「作成」")
+    return e
 
-    # 時刻
-    start_hm = panel.get("start_hm")
-    end_hm = panel.get("end_hm")
-    if not start_hm or not end_hm:
-        await interaction.followup.send("❌ 開始/終了が保存されてない。/setup からやり直してね", ephemeral=True)
-        return
+# ========= Modal =========
+class TitleModal(discord.ui.Modal, title="タイトル入力"):
+    name = discord.ui.TextInput(label="タイトル", placeholder="例：今日の部屋管理", max_length=50, required=False)
 
-    sh, sm = [int(x) for x in str(start_hm).split(":")]
-    eh, em = [int(x) for x in str(end_hm).split(":")]
+    def __init__(self, st: dict):
+        super().__init__(timeout=300)
+        self.st = st
 
-    day_date = day_key_to_date(day_key)
-    start_jst, end_jst = build_range_jst(day_date, sh, sm, eh, em)
+    async def on_submit(self, interaction: discord.Interaction):
+        self.st["title"] = (self.name.value or "").strip() or "無題"
+        await interaction.response.send_message("✅ タイトルを保存しました", ephemeral=True)
 
-    # slots 作り直し（重複防止：毎回削除して作成）
-    await db_to_thread(lambda: delete_slots(panel_id))
+# ========= View =========
+class SetupView(discord.ui.View):
+    def __init__(self, st: dict):
+        super().__init__(timeout=None)
+        self.st = st
 
-    rows = []
-    cur = start_jst
-    while cur < end_jst:
-        st_utc = cur.astimezone(UTC)
-        en_utc = (cur + timedelta(minutes=interval)).astimezone(UTC)
-        rows.append({
-            "panel_id": panel_id,
-            "start_at": st_utc.isoformat(),
-            "end_at": en_utc.isoformat(),
-            "reserved_by": None,
-            "slot_time": slot_time_label(st_utc),  # NOT NULL対策
-        })
-        cur += timedelta(minutes=interval)
+        # Row0: day buttons
+        self.add_item(discord.ui.Button(label="今日", style=discord.ButtonStyle.primary, custom_id="setup:day:today", row=0))
+        self.add_item(discord.ui.Button(label="明日", style=discord.ButtonStyle.secondary, custom_id="setup:day:tomorrow", row=0))
 
-    ins = await db_to_thread(lambda: insert_slots(rows))
-    created = ins.data or []
-    if not created:
-        await interaction.followup.send("❌ slots が作れなかった（slotsテーブル列を確認）", ephemeral=True)
-        return
+        # Row1: start hour/min
+        self.add_item(discord.ui.Select(custom_id="setup:start_h", placeholder="開始(時)", options=hour_options(), row=1))
+        self.add_item(discord.ui.Select(custom_id="setup:start_m", placeholder="開始(分)", options=minute_options(5), row=2))
 
-    # 投稿チャンネル
-    ch = interaction.guild.get_channel(int(notify_channel_id)) or interaction.channel
+        # Row3: end hour/min
+        self.add_item(discord.ui.Select(custom_id="setup:end_h", placeholder="終了(時)", options=hour_options(), row=3))
+        self.add_item(discord.ui.Select(custom_id="setup:end_m", placeholder="終了(分)", options=minute_options(5), row=4))
 
-    header = f"📅 **{title}**\n下のボタンで予約してね👇"
-    if mention_everyone:
-        header = "@everyone\n" + header
+        # Row0 (残り枠): interval + title + everyone
+        self.add_item(discord.ui.Select(custom_id="setup:interval", placeholder="間隔（20/25/30）", options=interval_options(), row=0))
+        self.add_item(discord.ui.Button(label="タイトル入力", style=discord.ButtonStyle.secondary, custom_id="setup:title", row=1))
+        self.add_item(discord.ui.Button(label="@everyone ON/OFF", style=discord.ButtonStyle.danger, custom_id="setup:everyone", row=1))
 
-    msg = await ch.send(header, view=SlotsView(sb, db_to_thread, panel_id, created))
+        # Row2: notify channel
+        cs = discord.ui.ChannelSelect(
+            custom_id="setup:notify_channel",
+            placeholder="通知チャンネル（未選択=このチャンネル）",
+            min_values=1, max_values=1,
+            channel_types=[discord.ChannelType.text],
+            row=2
+        )
+        self.add_item(cs)
 
-    # message_id保存
+        # Row3: create
+        self.add_item(discord.ui.Button(label="作成", style=discord.ButtonStyle.success, custom_id="setup:create", row=3))
+
+# ========= Component handler（ここが超重要） =========
+@client.event
+async def on_interaction(interaction: discord.Interaction):
+    # Select/Button/Modal を全部ここで処理（※二重に作らない）
     try:
-        await db_to_thread(lambda: update_panel_message_id(panel_id, str(msg.id)))
-    except Exception:
-        pass
+        if interaction.type == discord.InteractionType.application_command:
+            await tree._call(interaction)
+            return
 
-    # @everyone は「1回だけ」仕様：使ったらOFFに戻す
-    if mention_everyone:
-        try:
-            await db_to_thread(lambda: upsert_panel({
+        if interaction.type == discord.InteractionType.modal_submit:
+            # モーダルは Modal 側で保存してるので何もしない
+            return
+
+        if interaction.type != discord.InteractionType.component:
+            return
+
+        data = interaction.data or {}
+        cid = data.get("custom_id") or ""
+        if not cid.startswith("setup:") and not cid.startswith("slot:"):
+            return
+
+        key = dkey(interaction)
+        st = draft.get(key)
+        if not st:
+            await interaction.response.send_message("❌ 状態がありません。/setup からやり直してね", ephemeral=True)
+            return
+
+        # --- Select values ---
+        vals = data.get("values") or []
+        if cid in ("setup:start_h","setup:start_m","setup:end_h","setup:end_m","setup:interval","setup:notify_channel"):
+            if not vals:
+                await interaction.response.send_message("❌ 値が取れませんでした（もう一度選んで）", ephemeral=True)
+                return
+            v = vals[0]
+
+            if cid == "setup:start_h":
+                st["start_h"] = int(v)
+            elif cid == "setup:start_m":
+                st["start_m"] = int(v)
+            elif cid == "setup:end_h":
+                st["end_h"] = int(v)
+            elif cid == "setup:end_m":
+                st["end_m"] = int(v)
+            elif cid == "setup:interval":
+                st["interval_minutes"] = int(v)
+            elif cid == "setup:notify_channel":
+                st["notify_channel_id"] = str(v)
+
+            await interaction.response.edit_message(embed=build_setup_embed(st), view=SetupView(st))
+            return
+
+        # --- Buttons ---
+        if cid == "setup:day:today":
+            st["day_key"] = "today"
+            await interaction.response.edit_message(embed=build_setup_embed(st), view=SetupView(st))
+            return
+
+        if cid == "setup:day:tomorrow":
+            st["day_key"] = "tomorrow"
+            await interaction.response.edit_message(embed=build_setup_embed(st), view=SetupView(st))
+            return
+
+        if cid == "setup:everyone":
+            st["mention_everyone"] = not bool(st.get("mention_everyone", False))
+            await interaction.response.edit_message(embed=build_setup_embed(st), view=SetupView(st))
+            return
+
+        if cid == "setup:title":
+            # モーダルは defer すると出ないのでそのまま出す
+            await interaction.response.send_modal(TitleModal(st))
+            return
+
+        if cid == "setup:create":
+            # バリデーション
+            start = hm_from_state(st, "start")
+            end = hm_from_state(st, "end")
+            if not start or not end:
+                await interaction.response.send_message("❌ 開始/終了が保存されてない。Selectで選んでから押してね", ephemeral=True)
+                return
+            if not st.get("interval_minutes"):
+                await interaction.response.send_message("❌ 間隔が未選択です", ephemeral=True)
+                return
+
+            # 通知ch 未選択ならここ
+            notify_ch = st.get("notify_channel_id") or str(interaction.channel_id)
+
+            row = {
                 "guild_id": str(interaction.guild_id),
-                "day_key": day_key,
-                "mention_everyone": False,
-            }))
+                "channel_id": str(interaction.channel_id),
+                "day_key": st.get("day_key", "today"),
+                "title": st.get("title") or "無題",
+                "start_hm": start,
+                "end_hm": end,
+                "interval_minutes": int(st["interval_minutes"]),
+                "notify_channel_id": notify_ch,
+                "mention_everyone": bool(st.get("mention_everyone", False)),
+                "created_by": str(interaction.user.id),
+                "created_at": datetime.utcnow().isoformat(),
+            }
+
+            await interaction.response.defer(ephemeral=True)
+            try:
+                await db_to_thread(lambda: upsert_panel(row))
+            except Exception as e:
+                await interaction.followup.send(f"❌ 保存失敗: {e}", ephemeral=True)
+                return
+
+            await interaction.followup.send("✅ 保存できた！次は /generate で枠ボタン生成してね", ephemeral=True)
+            return
+
+    except Exception:
+        # ここが落ちると「応答なし」になりやすいのでログは必ず見る
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ 内部エラー（Renderログ見て）", ephemeral=True)
         except Exception:
             pass
 
-    await interaction.followup.send("✅ 枠ボタンを生成して投稿した！", ephemeral=True)
-
-# ===== /reset =====
-@tree.command(name="reset", description="今日の募集を削除（パネル＆枠）")
-async def reset_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-
-    guild_id = str(interaction.guild_id)
-    day_key = "today"
-
-    pres = await db_to_thread(lambda: get_panel(guild_id, day_key))
-    if pres.data:
-        panel = pres.data[0]
-        panel_id = int(panel["id"])
-
-        # slots削除
-        await db_to_thread(lambda: delete_slots(panel_id))
-
-        # 投稿メッセ削除（できれば）
-        mid = panel.get("panel_message_id")
-        ch_id = panel.get("notify_channel_id") or panel.get("channel_id")
-        if mid and ch_id:
-            try:
-                ch = interaction.guild.get_channel(int(ch_id))
-                if ch:
-                    m = await ch.fetch_message(int(mid))
-                    await m.delete()
-            except Exception:
-                pass
-
-    # panel削除
-    await db_to_thread(lambda: delete_panel(guild_id, day_key))
-
-    await interaction.followup.send("✅ 今日の募集を削除したよ（パネル＆枠）", ephemeral=True)
-
-# ===== interaction handler（ここが肝：応答なし対策の中心） =====
-@client.event
-async def on_interaction(interaction: discord.Interaction):
-    # スラッシュはdiscord.pyに任せる
-    if interaction.type != discord.InteractionType.component:
-        return
-
-    data = interaction.data or {}
-    cid = data.get("custom_id") or ""
-    if not cid.startswith("setup:"):
-        return
-
-    st = ensure_state(interaction.user.id)
-
-    # ---- ボタン ----
-    if cid.startswith("setup:day:"):
-        st["day"] = cid.split(":")[-1]
-
-    elif cid == "setup:step:2":
-        st["step"] = 2
-
-    elif cid == "setup:step:1":
-        st["step"] = 1
-
-    elif cid == "setup:everyone:toggle":
-        st["mention_everyone"] = not bool(st.get("mention_everyone", False))
-
-    elif cid == "setup:title:open":
-        # モーダルは defer してると出せないので、そのまま送る
-        await interaction.response.send_modal(TitleModal(st))
-        return
-
-    elif cid == "setup:save":
-        # バリデーション
-        start = get_hm(st, "start_hour", "start_min")
-        end = get_hm(st, "end_hour", "end_min")
-        interval = st.get("interval")
-
-        if not start or not end:
-            await interaction.response.send_message("❌ 開始/終了を選んでね", ephemeral=True)
-            return
-        if not interval:
-            await interaction.response.send_message("❌ 間隔を選んでね", ephemeral=True)
-            return
-
-        # 時刻整合（同日で end<=start でも日跨ぎとしてOKにするので、ここは弾かない）
-        notify_ch = st.get("notify_channel_id") or int(interaction.channel_id)
-
-        row = {
-            "guild_id": str(interaction.guild_id),
-            "channel_id": str(interaction.channel_id),
-            "day_key": st.get("day", "today"),
-            "title": (st.get("title") or "").strip(),
-            "interval_minutes": int(interval),
-            "notify_channel_id": str(notify_ch),
-            "mention_everyone": bool(st.get("mention_everyone", False)),
-            "start_hm": start,
-            "end_hm": end,
-            "created_by": str(interaction.user.id),
-            "created_at": datetime.utcnow().isoformat(),
-        }
-
-        await interaction.response.defer(ephemeral=True)
-        try:
-            await db_to_thread(lambda: upsert_panel(row))
-        except Exception as e:
-            await interaction.followup.send(f"❌ 保存失敗: {e}", ephemeral=True)
-            return
-
-        await interaction.followup.send("✅ 保存できた！次は /generate で枠ボタン生成してね", ephemeral=True)
-        return
-
-    # ---- Selects ----
-    values = data.get("values") or []
-    if values:
-        val = values[0]
-        if cid == "setup:start_hour":
-            st["start_hour"] = int(val)
-        elif cid == "setup:start_min":
-            st["start_min"] = int(val)
-        elif cid == "setup:end_hour":
-            st["end_hour"] = int(val)
-        elif cid == "setup:end_min":
-            st["end_min"] = int(val)
-        elif cid == "setup:interval":
-            st["interval"] = int(val)
-        elif cid == "setup:notify_channel":
-            # channel select はID文字列が入る
-            st["notify_channel_id"] = int(val)
-
-    # 画面更新（これが「応答なし」を減らす）
-    embed = build_setup_embed(st)
-    view = build_setup_view(st)
-
-    try:
-        if not interaction.response.is_done():
-            await interaction.response.edit_message(embed=embed, view=view)
-        else:
-            await interaction.message.edit(embed=embed, view=view)
-    except Exception:
-        pass
+# ========= command =========
+@tree.command(name="setup", description="募集パネルを作る（設定画面を出す）")
+async def setup(interaction: discord.Interaction):
+    key = dkey(interaction)
+    draft[key] = {
+        "day_key": "today",
+        "start_h": None, "start_m": None,
+        "end_h": None, "end_m": None,
+        "interval_minutes": None,
+        "title": "無題",
+        "mention_everyone": False,
+        "notify_channel_id": None,
+    }
+    st = draft[key]
+    await interaction.response.send_message("設定して「作成」👇", embed=build_setup_embed(st), view=SetupView(st), ephemeral=False)
 
 @client.event
 async def on_ready():
@@ -347,10 +272,6 @@ async def on_ready():
     print(f"✅ Logged in as {client.user}")
 
 async def main():
-    if not TOKEN:
-        raise RuntimeError("DISCORD_TOKEN 未設定")
-    # 429避け
-    await asyncio.sleep(3)
-    await client.start(TOKEN.strip())
+    await client.start(TOKEN)
 
 asyncio.run(main())
