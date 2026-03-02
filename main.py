@@ -48,6 +48,9 @@ def insert_slots(rows: list[dict]):
 def update_panel_message_id(panel_id: int, message_id: str):
     return sb.table("panels").update({"panel_message_id": message_id}).eq("id", panel_id).execute()
 
+def delete_slots(panel_id: int):
+    return sb.table("slots").delete().eq("panel_id", panel_id).execute()
+
 def slot_label(dt: datetime):
     return dt.astimezone(JST).strftime("%H:%M")
 
