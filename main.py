@@ -135,118 +135,49 @@ class SetupView(discord.ui.View):
 # ========= Component handler（ここが超重要） =========
 @client.event
 async def on_interaction(interaction: discord.Interaction):
-    # Select/Button/Modal を全部ここで処理（※二重に作らない）
     try:
+        # ① スラッシュコマンド（/setup /generate /reset など）は必ず tree に渡す
         if interaction.type == discord.InteractionType.application_command:
             await tree._call(interaction)
             return
 
-        if interaction.type == discord.InteractionType.modal_submit:
-            # モーダルは Modal 側で保存してるので何もしない
-            return
+        # ② ボタン/セレクト/チャンネルセレクトなど（component）
+        if interaction.type == discord.InteractionType.component:
+            data = interaction.data or {}
+            cid = data.get("custom_id") or ""
 
-        if interaction.type != discord.InteractionType.component:
-            return
+            # setup系だけ自前処理したいならここで処理（※あなたのdraft反映用）
+            if cid.startswith("setup:"):
+                key = dkey(interaction)
+                if key in draft:
+                    st = draft[key]
+                    values = data.get("values") or []
 
-        data = interaction.data or {}
-        cid = data.get("custom_id") or ""
-        if not cid.startswith("setup:") and not cid.startswith("slot:"):
-            return
+                    # Select反映（あなたのcustom_idに合わせて）
+                    if cid == "setup:start_h" and values:
+                        st["start_h"] = int(values[0])
+                    elif cid == "setup:start_m" and values:
+                        st["start_m"] = int(values[0])
+                    elif cid == "setup:end_h" and values:
+                        st["end_h"] = int(values[0])
+                    elif cid == "setup:end_m" and values:
+                        st["end_m"] = int(values[0])
+                    elif cid == "setup:interval_select" and values:
+                        st["interval"] = int(values[0])
 
-        key = dkey(interaction)
-        st = draft.get(key)
-        if not st:
-            await interaction.response.send_message("❌ 状態がありません。/setup からやり直してね", ephemeral=True)
-            return
-
-        # --- Select values ---
-        vals = data.get("values") or []
-        if cid in ("setup:start_h","setup:start_m","setup:end_h","setup:end_m","setup:interval","setup:notify_channel"):
-            if not vals:
-                await interaction.response.send_message("❌ 値が取れませんでした（もう一度選んで）", ephemeral=True)
-                return
-            v = vals[0]
-
-            if cid == "setup:start_h":
-                st["start_h"] = int(v)
-            elif cid == "setup:start_m":
-                st["start_m"] = int(v)
-            elif cid == "setup:end_h":
-                st["end_h"] = int(v)
-            elif cid == "setup:end_m":
-                st["end_m"] = int(v)
-            elif cid == "setup:interval":
-                st["interval_minutes"] = int(v)
-            elif cid == "setup:notify_channel":
-                st["notify_channel_id"] = str(v)
-
-            await interaction.response.edit_message(embed=build_setup_embed(st), view=SetupView(st))
-            return
-
-        # --- Buttons ---
-        if cid == "setup:day:today":
-            st["day_key"] = "today"
-            await interaction.response.edit_message(embed=build_setup_embed(st), view=SetupView(st))
-            return
-
-        if cid == "setup:day:tomorrow":
-            st["day_key"] = "tomorrow"
-            await interaction.response.edit_message(embed=build_setup_embed(st), view=SetupView(st))
-            return
-
-        if cid == "setup:everyone":
-            st["mention_everyone"] = not bool(st.get("mention_everyone", False))
-            await interaction.response.edit_message(embed=build_setup_embed(st), view=SetupView(st))
-            return
-
-        if cid == "setup:title":
-            # モーダルは defer すると出ないのでそのまま出す
-            await interaction.response.send_modal(TitleModal(st))
-            return
-
-        if cid == "setup:create":
-            # バリデーション
-            start = hm_from_state(st, "start")
-            end = hm_from_state(st, "end")
-            if not start or not end:
-                await interaction.response.send_message("❌ 開始/終了が保存されてない。Selectで選んでから押してね", ephemeral=True)
-                return
-            if not st.get("interval_minutes"):
-                await interaction.response.send_message("❌ 間隔が未選択です", ephemeral=True)
+                # 重要：componentは必ずACK（edit_messageかdeferのどちらか）
+                if not interaction.response.is_done():
+                    # ここは「UI更新してる」なら edit_message が一番安全
+                    await interaction.response.defer()  # ← ひとまずACKだけ（ボタン側callbackが動くならここ不要）
                 return
 
-            # 通知ch 未選択ならここ
-            notify_ch = st.get("notify_channel_id") or str(interaction.channel_id)
+        # ③ それ以外は何もしない（discord.py標準の挙動に任せる）
+        return
 
-            row = {
-                "guild_id": str(interaction.guild_id),
-                "channel_id": str(interaction.channel_id),
-                "day_key": st.get("day_key", "today"),
-                "title": st.get("title") or "無題",
-                "start_hm": start,
-                "end_hm": end,
-                "interval_minutes": int(st["interval_minutes"]),
-                "notify_channel_id": notify_ch,
-                "mention_everyone": bool(st.get("mention_everyone", False)),
-                "created_by": str(interaction.user.id),
-                "created_at": datetime.utcnow().isoformat(),
-            }
-
-            await interaction.response.defer(ephemeral=True)
-            try:
-                await db_to_thread(lambda: upsert_panel(row))
-            except Exception as e:
-                await interaction.followup.send(f"❌ 保存失敗: {e}", ephemeral=True)
-                return
-
-            await interaction.followup.send("✅ 保存できた！次は /generate で枠ボタン生成してね", ephemeral=True)
-            return
-
-    except Exception:
-        # ここが落ちると「応答なし」になりやすいのでログは必ず見る
+    except Exception as e:
         try:
             if not interaction.response.is_done():
-                await interaction.response.send_message("❌ 内部エラー（Renderログ見て）", ephemeral=True)
+                await interaction.response.send_message(f"❌ on_interaction error: {e}", ephemeral=True)
         except Exception:
             pass
 
