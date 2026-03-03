@@ -6,8 +6,9 @@ import discord
 from discord import app_commands
 from supabase import create_client
 
-
-# ========= env =========
+# =========================================================
+# ENV
+# =========================================================
 TOKEN = os.getenv("DISCORD_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -20,16 +21,19 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 JST = timezone(timedelta(hours=9))
+UTC = timezone.utc
 
-
-# ========= discord =========
+# =========================================================
+# DISCORD
+# =========================================================
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-
-# ---- 状態（作成中の一時保存）----
+# =========================================================
+# STATE (wizard draft)
 # key: (guild_id, user_id) -> dict
+# =========================================================
 draft: dict[tuple[str, str], dict] = {}
 
 
@@ -41,9 +45,10 @@ async def db_to_thread(fn):
     return await asyncio.to_thread(fn)
 
 
-# ========= DB helpers =========
+# =========================================================
+# DB helpers
+# =========================================================
 def upsert_panel(row: dict):
-    # panels に (guild_id, day_key) のユニーク制約がある前提
     return sb.table("panels").upsert(row, on_conflict="guild_id,day_key").execute()
 
 
@@ -58,7 +63,11 @@ def get_panel(guild_id: str, day_key: str):
     )
 
 
-def delete_slots(panel_id: int):
+def update_panel_message_id(panel_id: int, message_id: str):
+    return sb.table("panels").update({"panel_message_id": message_id}).eq("id", panel_id).execute()
+
+
+def delete_slots_by_panel(panel_id: int):
     return sb.table("slots").delete().eq("panel_id", panel_id).execute()
 
 
@@ -66,17 +75,57 @@ def insert_slots(rows: list[dict]):
     return sb.table("slots").insert(rows).execute()
 
 
-def get_slot(slot_id: int):
-    return sb.table("slots").select("*").eq("id", slot_id).limit(1).execute()
+def get_slots(panel_id: int):
+    return sb.table("slots").select("*").eq("panel_id", panel_id).order("start_at").execute()
 
 
-def update_slot(slot_id: int, patch: dict):
-    return sb.table("slots").update(patch).eq("id", slot_id).execute()
+def clear_slot_reserved(slot_id: int):
+    return (
+        sb.table("slots")
+        .update(
+            {
+                "reserved_by": None,
+                "reserver_user_id": None,
+                "reserver_name": None,
+                "reserved_at": None,
+            }
+        )
+        .eq("id", slot_id)
+        .execute()
+    )
 
 
-# ========= UI helpers =========
-def hour_options():
+def set_slot_reserved(slot_id: int, user_id: str, user_name: str):
+    return (
+        sb.table("slots")
+        .update(
+            {
+                "reserved_by": user_id,
+                "reserver_user_id": int(user_id),
+                "reserver_name": user_name,
+                "reserved_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        .eq("id", slot_id)
+        .is_("reserved_by", "null")
+        .execute()
+    )
+
+
+# =========================================================
+# UI options/helpers
+# =========================================================
+def _cur(base: str, v):
+    # 7枚目風：placeholderに「現在:xx」を表示
+    return f"{base} 現在:{v:02d}" if isinstance(v, int) else f"{base} 現在:--"
+
+
+def hour_options_0_23():
     return [discord.SelectOption(label=f"{h:02d}", value=str(h)) for h in range(24)]
+
+
+def hour_options_0_24_for_end():
+    return [discord.SelectOption(label=f"{h:02d}", value=str(h)) for h in range(25)]  # 24含む
 
 
 def minute_options(step=5):
@@ -91,7 +140,7 @@ def interval_options():
     ]
 
 
-def hm_from_state(st: dict, prefix: str) -> str | None:
+def hm(st: dict, prefix: str) -> str | None:
     h = st.get(f"{prefix}_h")
     m = st.get(f"{prefix}_m")
     if h is None or m is None:
@@ -104,325 +153,293 @@ def day_label(day_key: str) -> str:
 
 
 def build_setup_embed(st: dict) -> discord.Embed:
+    step = int(st.get("step", 1))
     e = discord.Embed(title="募集パネル作成ウィザード", color=0x5865F2)
 
-    e.add_field(name="Step", value=str(st.get("step", 1)), inline=True)
-    e.add_field(name="日付", value=day_label(st.get("day_key", "today")), inline=True)
+    e.add_field(name="Step", value=str(step), inline=False)
+    e.add_field(name="日付", value=day_label(st["day_key"]), inline=True)
 
-    start = hm_from_state(st, "start")
-    end = hm_from_state(st, "end")
+    start = hm(st, "start")
+    end = hm(st, "end")
     e.add_field(name="開始", value=(start or "未選択"), inline=True)
     e.add_field(name="終了", value=(end or "未選択"), inline=True)
 
-    interval = st.get("interval_minutes")
-    e.add_field(name="間隔", value=(f"{interval}分" if interval else "未選択"), inline=True)
+    if step >= 2:
+        interval = st.get("interval_minutes")
+        e.add_field(name="間隔", value=(f"{interval}分" if interval else "未選択"), inline=True)
 
-    title = st.get("title") or "無題"
-    e.add_field(name="タイトル", value=title, inline=False)
+        title = st.get("title") or "無題"
+        e.add_field(name="タイトル", value=title, inline=False)
 
-    # ★重要：ここは「3分前通知の送信先」
-    notify = st.get("notify_channel_id")
-    e.add_field(
-        name="通知チャンネル（3分前通知の送信先）",
-        value=(f"<#{notify}>" if notify else "未選択＝このチャンネル"),
-        inline=False,
-    )
+        notify_id = st.get("notify_channel_id")
+        notify_txt = f"<#{notify_id}>" if notify_id else "このチャンネル（未選択）"
+        e.add_field(name="通知チャンネル（3分前通知用）", value=notify_txt, inline=False)
 
-    everyone = bool(st.get("mention_everyone", False))
-    e.add_field(name="@everyone", value=("ON" if everyone else "OFF"), inline=True)
+        everyone = bool(st.get("mention_everyone", False))
+        e.add_field(name="@everyone", value=("ON" if everyone else "OFF"), inline=True)
 
     e.set_footer(text="Step1→「次へ」 / Step2→「作成」")
     return e
 
 
+# =========================================================
+# TIME helpers for slots
+# =========================================================
 def jst_today() -> date:
     return datetime.now(JST).date()
 
 
-def to_panel_day(day_key: str) -> date:
+def panel_base_day(day_key: str) -> date:
     d = jst_today()
     return d if day_key == "today" else (d + timedelta(days=1))
 
 
-def make_dt_jst(d: date, hm: str) -> datetime:
-    h, m = hm.split(":")
-    return datetime(d.year, d.month, d.day, int(h), int(m), tzinfo=JST)
+def make_dt_jst(d: date, hh: int, mm: int) -> datetime:
+    return datetime(d.year, d.month, d.day, hh, mm, tzinfo=JST)
 
 
-def slot_time_str(dt_jst: datetime) -> str:
-    return dt_jst.strftime("%H:%M")
-
-
-# ========= Modal =========
+# =========================================================
+# MODAL
+# =========================================================
 class TitleModal(discord.ui.Modal, title="タイトル入力"):
-    name = discord.ui.TextInput(
-        label="タイトル", placeholder="例：今日の部屋管理", max_length=50, required=False
+    title_in = discord.ui.TextInput(
+        label="タイトル",
+        placeholder="例：今日の部屋管理",
+        max_length=50,
+        required=False,
     )
 
-    def __init__(self, st: dict, msg: discord.Message):
+    def __init__(self, key: tuple[str, str]):
         super().__init__(timeout=300)
-        self.st = st
-        self.msg = msg
+        self.key = key
 
     async def on_submit(self, interaction: discord.Interaction):
-        self.st["title"] = (self.name.value or "").strip() or "無題"
-        # 入力内容を embed に即反映
-        await interaction.response.edit_message(
-            embed=build_setup_embed(self.st),
-            view=SetupView(self.st, self.msg),
-        )
+        st = draft.get(self.key)
+        if not st:
+            await interaction.response.send_message("❌ 先に /setup からやり直してね", ephemeral=True)
+            return
+
+        st["title"] = (self.title_in.value or "").strip() or "無題"
+
+        # モーダルの元メッセージを更新
+        view = SetupWizardView(self.key)
+        embed = build_setup_embed(st)
+        await interaction.response.edit_message(embed=embed, view=view)
+        await interaction.followup.send("✅ タイトルを反映したよ", ephemeral=True)
 
 
-# ========= View =========
-class SetupView(discord.ui.View):
-    """
-    毎回 View を作り直して、
-    - 選ばれてるボタンを強調
-    - @everyone の色を切替
-    - 選択内容を embed に反映
-    を安定してやる
-    """
+# =========================================================
+# SETUP WIZARD VIEW (7枚目風: 現在値表示)
+# =========================================================
+class SetupWizardView(discord.ui.View):
+    def __init__(self, key: tuple[str, str]):
+        super().__init__(timeout=600)
+        self.key = key
 
-    def __init__(self, st: dict, msg: discord.Message):
-        super().__init__(timeout=None)
-        self.st = st
-        self.msg = msg
+        st = draft.get(key)
+        if not st:
+            return
 
         step = int(st.get("step", 1))
-        day_key = st.get("day_key", "today")
-        everyone = bool(st.get("mention_everyone", False))
-
-        # --- Row0: 今日/明日 + 次へ/戻る/作成
-        self.add_item(DayButton("今日", "today", style=discord.ButtonStyle.primary if day_key == "today" else discord.ButtonStyle.secondary, row=0))
-        self.add_item(DayButton("明日", "tomorrow", style=discord.ButtonStyle.primary if day_key == "tomorrow" else discord.ButtonStyle.secondary, row=0))
-
         if step == 1:
-            self.add_item(NextButton(row=0))
+            self._build_step1(st)
         else:
-            self.add_item(BackButton(row=0))
-            self.add_item(CreateButton(row=0))
+            self._build_step2(st)
 
-        # --- Step1: 時刻選択
-        if step == 1:
-            self.add_item(TimeSelect("setup:start_h", "開始(時)", hour_options(), row=1))
-            self.add_item(TimeSelect("setup:start_m", "開始(分)", minute_options(5), row=2))
-            self.add_item(TimeSelect("setup:end_h", "終了(時)", hour_options(), row=3))
-            self.add_item(TimeSelect("setup:end_m", "終了(分)", minute_options(5), row=4))
+    def _build_step1(self, st: dict):
+        # 今日/明日（選択中を強調）
+        today_style = discord.ButtonStyle.primary if st["day_key"] == "today" else discord.ButtonStyle.secondary
+        tomo_style = discord.ButtonStyle.primary if st["day_key"] == "tomorrow" else discord.ButtonStyle.secondary
+        self.add_item(DayButton(self.key, "today", "今日", today_style))
+        self.add_item(DayButton(self.key, "tomorrow", "明日", tomo_style))
+        self.add_item(NextButton(self.key))
 
-        # --- Step2: 詳細設定
-        if step == 2:
-            self.add_item(IntervalSelect(row=1))
-            self.add_item(TitleButton(row=2))
-            # ONなら緑 / OFFなら赤
-            self.add_item(EveryoneButton(style=discord.ButtonStyle.success if everyone else discord.ButtonStyle.danger, row=2))
-            self.add_item(NotifyChannelSelect(row=3))
+        # 7枚目風：placeholderに現在値
+        self.add_item(TimeSelect(self.key, "start_h", _cur("開始(時)", st.get("start_h")), hour_options_0_23(), row=1))
+        self.add_item(TimeSelect(self.key, "start_m", _cur("開始(分)", st.get("start_m")), minute_options(5), row=2))
+        self.add_item(TimeSelect(self.key, "end_h", _cur("終了(時)", st.get("end_h")), hour_options_0_24_for_end(), row=3))
+        self.add_item(TimeSelect(self.key, "end_m", _cur("終了(分)", st.get("end_m")), minute_options(5), row=4))
+
+    def _build_step2(self, st: dict):
+        # 間隔（現在表示）
+        self.add_item(IntervalSelect(self.key, _cur("間隔（分）", st.get("interval_minutes")), row=1))
+
+        # タイトル
+        self.add_item(TitleButton(self.key, row=2))
+
+        # everyone（ON=緑 / OFF=灰、ラベルも変える）
+        on = bool(st.get("mention_everyone", False))
+        style = discord.ButtonStyle.success if on else discord.ButtonStyle.secondary
+        label = "@everyone ON" if on else "@everyone OFF"
+        self.add_item(EveryoneToggleButton(self.key, label=label, style=style, row=2))
+
+        # 通知チャンネル（3分前通知用）→ 選んだらembedで見える
+        self.add_item(NotifyChannelSelect(self.key, row=3))
+
+        # 戻る/作成
+        self.add_item(BackButton(self.key, row=4))
+        self.add_item(CreateButton(self.key, row=4))
 
 
 class DayButton(discord.ui.Button):
-    def __init__(self, label: str, day_key: str, style: discord.ButtonStyle, row: int):
-        super().__init__(label=label, style=style, custom_id=f"setup:day:{day_key}", row=row)
+    def __init__(self, key, day_key, label, style):
+        super().__init__(label=label, style=style, custom_id=f"setup:day:{day_key}", row=0)
+        self.key = key
         self.day_key = day_key
 
     async def callback(self, interaction: discord.Interaction):
-        st = draft.get(dkey(interaction))
+        st = draft.get(self.key)
         if not st:
             return await interaction.response.send_message("❌ /setup からやり直してね", ephemeral=True)
+
         st["day_key"] = self.day_key
-        await interaction.response.edit_message(embed=build_setup_embed(st), view=SetupView(st, interaction.message))  # type: ignore
-
-
-class NextButton(discord.ui.Button):
-    def __init__(self, row: int):
-        super().__init__(label="次へ", style=discord.ButtonStyle.success, custom_id="setup:next", row=row)
-
-    async def callback(self, interaction: discord.Interaction):
-        st = draft.get(dkey(interaction))
-        if not st:
-            return await interaction.response.send_message("❌ /setup からやり直してね", ephemeral=True)
-
-        # Step1 の入力必須チェック
-        if hm_from_state(st, "start") is None or hm_from_state(st, "end") is None:
-            return await interaction.response.send_message("❌ 開始/終了（時・分）を選んでね", ephemeral=True)
-
-        st["step"] = 2
-        await interaction.response.edit_message(embed=build_setup_embed(st), view=SetupView(st, interaction.message))  # type: ignore
-
-
-class BackButton(discord.ui.Button):
-    def __init__(self, row: int):
-        super().__init__(label="戻る", style=discord.ButtonStyle.secondary, custom_id="setup:back", row=row)
-
-    async def callback(self, interaction: discord.Interaction):
-        st = draft.get(dkey(interaction))
-        if not st:
-            return await interaction.response.send_message("❌ /setup からやり直してね", ephemeral=True)
-        st["step"] = 1
-        await interaction.response.edit_message(embed=build_setup_embed(st), view=SetupView(st, interaction.message))  # type: ignore
+        await interaction.response.edit_message(embed=build_setup_embed(st), view=SetupWizardView(self.key))
 
 
 class TimeSelect(discord.ui.Select):
-    def __init__(self, cid: str, placeholder: str, options: list[discord.SelectOption], row: int):
-        super().__init__(custom_id=cid, placeholder=placeholder, options=options, min_values=1, max_values=1, row=row)
+    def __init__(self, key, field, placeholder, options, row):
+        super().__init__(
+            placeholder=placeholder,
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id=f"setup:{field}",
+            row=row,
+        )
+        self.key = key
+        self.field = field
 
     async def callback(self, interaction: discord.Interaction):
-        st = draft.get(dkey(interaction))
+        st = draft.get(self.key)
         if not st:
             return await interaction.response.send_message("❌ /setup からやり直してね", ephemeral=True)
 
-        v = int(self.values[0])
-        if self.custom_id == "setup:start_h":
-            st["start_h"] = v
-        elif self.custom_id == "setup:start_m":
-            st["start_m"] = v
-        elif self.custom_id == "setup:end_h":
-            st["end_h"] = v
-        elif self.custom_id == "setup:end_m":
-            st["end_m"] = v
-
-        await interaction.response.edit_message(embed=build_setup_embed(st), view=SetupView(st, interaction.message))  # type: ignore
+        st[self.field] = int(self.values[0])
+        await interaction.response.edit_message(embed=build_setup_embed(st), view=SetupWizardView(self.key))
 
 
 class IntervalSelect(discord.ui.Select):
-    def __init__(self, row: int):
+    def __init__(self, key, placeholder, row):
         super().__init__(
-            custom_id="setup:interval_minutes",
-            placeholder="間隔（20/25/30）",
-            options=interval_options(),
+            placeholder=placeholder,
             min_values=1,
             max_values=1,
+            options=interval_options(),
+            custom_id="setup:interval",
             row=row,
         )
+        self.key = key
 
     async def callback(self, interaction: discord.Interaction):
-        st = draft.get(dkey(interaction))
+        st = draft.get(self.key)
         if not st:
             return await interaction.response.send_message("❌ /setup からやり直してね", ephemeral=True)
+
         st["interval_minutes"] = int(self.values[0])
-        await interaction.response.edit_message(embed=build_setup_embed(st), view=SetupView(st, interaction.message))  # type: ignore
+        await interaction.response.edit_message(embed=build_setup_embed(st), view=SetupWizardView(self.key))
+
+
+class NextButton(discord.ui.Button):
+    def __init__(self, key):
+        super().__init__(label="次へ", style=discord.ButtonStyle.success, custom_id="setup:next", row=0)
+        self.key = key
+
+    async def callback(self, interaction: discord.Interaction):
+        st = draft.get(self.key)
+        if not st:
+            return await interaction.response.send_message("❌ /setup からやり直してね", ephemeral=True)
+
+        if hm(st, "start") is None or hm(st, "end") is None:
+            return await interaction.response.send_message("❌ 開始/終了（時・分）を選んでね", ephemeral=True)
+
+        st["step"] = 2
+        await interaction.response.edit_message(embed=build_setup_embed(st), view=SetupWizardView(self.key))
+
+
+class BackButton(discord.ui.Button):
+    def __init__(self, key, row):
+        super().__init__(label="戻る", style=discord.ButtonStyle.secondary, custom_id="setup:back", row=row)
+        self.key = key
+
+    async def callback(self, interaction: discord.Interaction):
+        st = draft.get(self.key)
+        if not st:
+            return await interaction.response.send_message("❌ /setup からやり直してね", ephemeral=True)
+
+        st["step"] = 1
+        await interaction.response.edit_message(embed=build_setup_embed(st), view=SetupWizardView(self.key))
 
 
 class TitleButton(discord.ui.Button):
-    def __init__(self, row: int):
+    def __init__(self, key, row):
         super().__init__(label="タイトル入力", style=discord.ButtonStyle.secondary, custom_id="setup:title", row=row)
+        self.key = key
 
     async def callback(self, interaction: discord.Interaction):
-        st = draft.get(dkey(interaction))
+        st = draft.get(self.key)
         if not st:
             return await interaction.response.send_message("❌ /setup からやり直してね", ephemeral=True)
-        await interaction.response.send_modal(TitleModal(st, interaction.message))  # type: ignore
+        await interaction.response.send_modal(TitleModal(self.key))
 
 
-class EveryoneButton(discord.ui.Button):
-    def __init__(self, style: discord.ButtonStyle, row: int):
-        super().__init__(label="@everyone ON/OFF", style=style, custom_id="setup:everyone", row=row)
+class EveryoneToggleButton(discord.ui.Button):
+    def __init__(self, key, label, style, row):
+        super().__init__(label=label, style=style, custom_id="setup:everyone", row=row)
+        self.key = key
 
     async def callback(self, interaction: discord.Interaction):
-        st = draft.get(dkey(interaction))
+        st = draft.get(self.key)
         if not st:
             return await interaction.response.send_message("❌ /setup からやり直してね", ephemeral=True)
+
         st["mention_everyone"] = not bool(st.get("mention_everyone", False))
-        await interaction.response.edit_message(embed=build_setup_embed(st), view=SetupView(st, interaction.message))  # type: ignore
+        await interaction.response.edit_message(embed=build_setup_embed(st), view=SetupWizardView(self.key))
 
 
 class NotifyChannelSelect(discord.ui.ChannelSelect):
-    def __init__(self, row: int):
+    def __init__(self, key, row):
         super().__init__(
             custom_id="setup:notify_channel",
-            placeholder="通知チャンネル（3分前通知の送信先）",
+            placeholder="通知チャンネル（3分前通知用）",
             min_values=1,
             max_values=1,
             channel_types=[discord.ChannelType.text],
             row=row,
         )
+        self.key = key
 
     async def callback(self, interaction: discord.Interaction):
-        st = draft.get(dkey(interaction))
+        st = draft.get(self.key)
         if not st:
             return await interaction.response.send_message("❌ /setup からやり直してね", ephemeral=True)
 
         ch = self.values[0]
         st["notify_channel_id"] = str(ch.id)
-        await interaction.response.edit_message(embed=build_setup_embed(st), view=SetupView(st, interaction.message))  # type: ignore
+        await interaction.response.edit_message(embed=build_setup_embed(st), view=SetupWizardView(self.key))
 
 
-class CreateButton(discord.ui.Button):
-    def __init__(self, row: int):
-        super().__init__(label="作成", style=discord.ButtonStyle.success, custom_id="setup:create", row=row)
-
-    async def callback(self, interaction: discord.Interaction):
-        st = draft.get(dkey(interaction))
-        if not st:
-            return await interaction.response.send_message("❌ /setup からやり直してね", ephemeral=True)
-
-        # 必須チェック
-        start_hm = hm_from_state(st, "start")
-        end_hm = hm_from_state(st, "end")
-        interval = st.get("interval_minutes")
-        if not start_hm or not end_hm or not interval:
-            return await interaction.response.send_message("❌ 開始/終了/間隔 が未選択。Stepを埋めてね", ephemeral=True)
-
-        # panelsへ保存（※notify_channel_id は「3分前通知先」）
-        row = {
-            "guild_id": str(interaction.guild_id),
-            "channel_id": str(interaction.channel_id),  # パネルを出した場所（枠を置く場所）
-            "day_key": st.get("day_key", "today"),
-            "title": st.get("title", "無題"),
-            "interval_minutes": int(interval),
-            "notify_channel_id": st.get("notify_channel_id"),  # 3分前通知先
-            "mention_everyone": bool(st.get("mention_everyone", False)),
-            "created_by": str(interaction.user.id),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            # DBにある想定の列（あなたの panels 画面にあった）
-            "start_hm": start_hm,
-            "end_hm": end_hm,
-            "start_h": int(st["start_h"]),
-            "start_m": int(st["start_m"]),
-            "end_h": int(st["end_h"]),
-            "end_m": int(st["end_m"]),
-        }
-
-        await interaction.response.defer(ephemeral=True)
-        try:
-            await db_to_thread(lambda: upsert_panel(row))
-        except Exception as e:
-            await interaction.followup.send(f"❌ 保存失敗: {e}", ephemeral=True)
-            return
-
-        # @everyone は「作成時1回だけ送る」
-        if bool(st.get("mention_everyone", False)):
-            try:
-                await interaction.channel.send("@everyone 募集を開始しました！")  # type: ignore
-            except Exception:
-                pass
-
-        await interaction.followup.send("✅ 保存できた！次は /generate で枠ボタン生成してね", ephemeral=True)
-
-
-# ========= Slots UI =========
+# =========================================================
+# PUBLIC PANEL (slots)
+# =========================================================
 def build_panel_embed(panel: dict, slots: list[dict]) -> discord.Embed:
-    # 表示イメージ：日付 / interval / 枠の一覧 + 凡例
-    day_key = panel.get("day_key", "today")
-    interval = int(panel.get("interval_minutes", 30))
     title = panel.get("title", "募集パネル")
+    interval = int(panel.get("interval_minutes", 30))
+    day_key = panel.get("day_key", "today")
 
-    d = to_panel_day(day_key)
-    header = f"{d.isoformat()} (JST)  / interval {interval}min"
-
-    e = discord.Embed(title=title, description=header, color=0x2B2D31)
+    e = discord.Embed(title=title, color=0x2B2D31)
+    e.description = f"📅 {day_label(day_key)}（JST） / interval {interval}min"
 
     lines = []
-    for s in slots:
-        t = s["slot_time"]
-        is_break = bool(s.get("is_break", False))
-        reserved_by = s.get("reserved_by")
-        if is_break:
+    for r in slots[:12]:
+        t = r.get("slot_time", "??:??")
+        if r.get("is_break"):
             lines.append(f"⚪ {t} 休憩")
-        elif reserved_by:
-            lines.append(f"🔴 {t} <@{reserved_by}>")
+        elif r.get("reserved_by"):
+            lines.append(f"🔴 {t} <@{r['reserved_by']}>")
         else:
             lines.append(f"🟢 {t}")
 
-    e.add_field(name="枠", value="\n".join(lines) if lines else "なし", inline=False)
+    e.add_field(name="枠", value="\n".join(lines) if lines else "（なし）", inline=False)
     e.add_field(name="凡例", value="🟢空き / 🔴予約済み（本人は押すとキャンセル） / ⚪休憩（予約不可）", inline=False)
     return e
 
@@ -432,226 +449,245 @@ class SlotsView(discord.ui.View):
         super().__init__(timeout=None)
         self.panel_id = panel_id
 
-        # 25ボタン制限があるので最大20個まで
-        for s in slots[:20]:
-            self.add_item(SlotButton(slot_id=int(s["id"])))
+        for r in slots[:20]:
+            sid = int(r["id"])
+            label = r.get("slot_time", "??:??")
+            is_break = bool(r.get("is_break", False))
+            reserved_by = r.get("reserved_by")
 
-        # ここに「通知ON」や「休憩切替」などを後で追加できる
+            if is_break:
+                style = discord.ButtonStyle.secondary
+                disabled = True
+            elif reserved_by:
+                style = discord.ButtonStyle.danger
+                disabled = False
+            else:
+                style = discord.ButtonStyle.success
+                disabled = False
+
+            self.add_item(SlotButton(panel_id, sid, label, style, disabled))
 
 
 class SlotButton(discord.ui.Button):
-    def __init__(self, slot_id: int):
-        super().__init__(label="...", style=discord.ButtonStyle.secondary, custom_id=f"slot:{slot_id}")
+    def __init__(self, panel_id: int, slot_id: int, label: str, style: discord.ButtonStyle, disabled: bool):
+        super().__init__(label=label, style=style, custom_id=f"slot:{slot_id}", disabled=disabled)
+        self.panel_id = panel_id
         self.slot_id = slot_id
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
-        # 最新状態をDBから取得
-        try:
-            res = await db_to_thread(lambda: get_slot(self.slot_id))
-        except Exception as e:
-            return await interaction.followup.send(f"❌ 取得失敗: {e}", ephemeral=True)
-
-        if not res.data:
-            return await interaction.followup.send("❌ その枠が見つからない", ephemeral=True)
-
-        s = res.data[0]
-        if bool(s.get("is_break", False)):
-            return await interaction.followup.send("❌ 休憩枠は予約できない", ephemeral=True)
-
         user_id = str(interaction.user.id)
-        reserved_by = s.get("reserved_by")
+        user_name = interaction.user.display_name
 
-        # 本人なら「押すとキャンセル」
+        # 最新読み込み
+        def work_get():
+            return sb.table("slots").select("*").eq("id", self.slot_id).limit(1).execute()
+
+        res = await db_to_thread(work_get)
+        if not res.data:
+            return await interaction.followup.send("❌ 枠が見つからない", ephemeral=True)
+
+        slot = res.data[0]
+        if bool(slot.get("is_break", False)):
+            return await interaction.followup.send("❌ 休憩枠です", ephemeral=True)
+
+        reserved_by = slot.get("reserved_by")
+
         if reserved_by and str(reserved_by) == user_id:
-            patch = {
-                "reserved_by": None,
-                "reserver_user_id": None,
-                "reserver_name": None,
-                "reserved_at": None,
-            }
-            try:
-                await db_to_thread(lambda: update_slot(self.slot_id, patch))
-            except Exception as e:
-                return await interaction.followup.send(f"❌ キャンセル失敗: {e}", ephemeral=True)
-
-            await interaction.followup.send("✅ キャンセルしたよ！", ephemeral=True)
+            # キャンセル
+            await db_to_thread(lambda: clear_slot_reserved(self.slot_id))
+            await interaction.followup.send("✅ キャンセルしたよ", ephemeral=True)
         else:
-            # 他人が既に予約済みなら不可
             if reserved_by:
-                return await interaction.followup.send("❌ その枠はすでに予約されています", ephemeral=True)
+                return await interaction.followup.send("❌ すでに予約されています", ephemeral=True)
 
-            patch = {
-                "reserved_by": user_id,
-                "reserver_user_id": int(user_id),
-                "reserver_name": interaction.user.display_name,
-                "reserved_at": datetime.now(timezone.utc).isoformat(),
-            }
-            try:
-                await db_to_thread(lambda: update_slot(self.slot_id, patch))
-            except Exception as e:
-                return await interaction.followup.send(f"❌ 予約失敗: {e}", ephemeral=True)
+            up = await db_to_thread(lambda: set_slot_reserved(self.slot_id, user_id, user_name))
+            if not up.data:
+                return await interaction.followup.send("❌ 先に取られた", ephemeral=True)
+            await interaction.followup.send("✅ 予約したよ", ephemeral=True)
 
-            await interaction.followup.send("✅ 予約したよ！", ephemeral=True)
+        # パネル更新
+        await refresh_panel(interaction.guild, self.panel_id)
 
-        # パネルを即更新（同じメッセージを編集）
+
+async def refresh_panel(guild: discord.Guild, panel_id: int):
+    # panel
+    pres = await db_to_thread(lambda: sb.table("panels").select("*").eq("id", panel_id).limit(1).execute())
+    if not pres.data:
+        return
+    panel = pres.data[0]
+    msg_id = panel.get("panel_message_id")
+    ch_id = panel.get("channel_id")
+    if not msg_id or not ch_id:
+        return
+
+    sres = await db_to_thread(lambda: get_slots(panel_id))
+    slots = sres.data or []
+
+    ch = guild.get_channel(int(ch_id))
+    if not isinstance(ch, discord.TextChannel):
+        return
+
+    try:
+        msg = await ch.fetch_message(int(msg_id))
+    except Exception:
+        return
+
+    await msg.edit(embed=build_panel_embed(panel, slots), view=SlotsView(panel_id, slots))
+
+
+# =========================================================
+# CREATE (Step2 "作成") -> 公開投稿まで一気にやる
+# =========================================================
+class CreateButton(discord.ui.Button):
+    def __init__(self, key, row):
+        super().__init__(label="作成", style=discord.ButtonStyle.success, custom_id="setup:create", row=row)
+        self.key = key
+
+    async def callback(self, interaction: discord.Interaction):
+        st = draft.get(self.key)
+        if not st:
+            return await interaction.response.send_message("❌ /setup からやり直してね", ephemeral=True)
+
+        start_hm = hm(st, "start")
+        end_hm = hm(st, "end")
+        interval = st.get("interval_minutes")
+        if not start_hm or not end_hm or not interval:
+            return await interaction.response.send_message("❌ 未選択があります（開始/終了/間隔）", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+
+        gid = str(interaction.guild_id)
+        uid = str(interaction.user.id)
+        day_key = st["day_key"]
+
+        # panels 保存（DB列に合わせる）
+        row = {
+            "guild_id": gid,
+            "channel_id": str(interaction.channel_id),   # パネル投稿先（公開）
+            "day_key": day_key,
+            "title": st.get("title") or "無題",
+            "interval_minutes": int(interval),
+            "notify_channel_id": st.get("notify_channel_id"),  # 3分前通知用
+            "mention_everyone": bool(st.get("mention_everyone", False)),
+            "created_by": uid,
+            "created_at": datetime.now(UTC).isoformat(),
+            "start_h": int(st["start_h"]),
+            "start_m": int(st["start_m"]),
+            "end_h": int(st["end_h"]),
+            "end_m": int(st["end_m"]),
+            "start_hm": start_hm,
+            "end_hm": end_hm,
+        }
+
         try:
-            msg = interaction.message  # type: ignore
-            # panel_id を slots から辿る
-            panel_id = int(s["panel_id"])
-            # panel と slots を再取得
-            pres = await db_to_thread(lambda: sb.table("panels").select("*").eq("id", panel_id).limit(1).execute())
-            sres = await db_to_thread(lambda: sb.table("slots").select("*").eq("panel_id", panel_id).order("start_at").execute())
-            if pres.data and sres.data:
-                panel = pres.data[0]
-                slots = sres.data
-                await msg.edit(embed=build_panel_embed(panel, slots), view=SlotsView(panel_id, slots))
+            await db_to_thread(lambda: upsert_panel(row))
+        except Exception as e:
+            return await interaction.followup.send(f"❌ 保存失敗: {e}", ephemeral=True)
+
+        pres = await db_to_thread(lambda: get_panel(gid, day_key))
+        if not pres.data:
+            return await interaction.followup.send("❌ panels が取れない", ephemeral=True)
+
+        panel = pres.data[0]
+        panel_id = int(panel["id"])
+
+        # slots 生成（既存削除）
+        try:
+            await db_to_thread(lambda: delete_slots_by_panel(panel_id))
         except Exception:
             pass
 
+        base = panel_base_day(day_key)
 
-# ========= Commands =========
-@tree.command(name="setup", description="募集パネルを作る（設定画面を出す）")
-async def setup(interaction: discord.Interaction):
+        sh = int(panel["start_h"])
+        sm = int(panel["start_m"])
+        eh = int(panel["end_h"])
+        em = int(panel["end_m"])
+        interval = int(panel["interval_minutes"])
+
+        start_dt = make_dt_jst(base, sh, sm)
+
+        # 24:00対応
+        if eh == 24 and em == 0:
+            end_dt = make_dt_jst(base, 0, 0) + timedelta(days=1)
+        else:
+            end_dt = make_dt_jst(base, eh, em)
+
+        if end_dt <= start_dt:
+            end_dt = end_dt + timedelta(days=1)
+
+        rows = []
+        cur = start_dt
+        while cur < end_dt:
+            nxt = cur + timedelta(minutes=interval)
+            rows.append(
+                {
+                    "panel_id": panel_id,
+                    "start_at": cur.astimezone(UTC).isoformat(),
+                    "end_at": nxt.astimezone(UTC).isoformat(),
+                    "slot_time": cur.strftime("%H:%M"),
+                    "is_break": False,
+                    "notified": False,
+                    "reserved_by": None,
+                    "reserver_user_id": None,
+                    "reserver_name": None,
+                    "reserved_at": None,
+                }
+            )
+            cur = nxt
+
+        ins = await db_to_thread(lambda: insert_slots(rows))
+        slots = ins.data or []
+        if not slots:
+            return await interaction.followup.send("❌ slots が作れなかった（slotsの列/NOT NULLを確認）", ephemeral=True)
+
+        # 公開投稿
+        content = "@everyone 募集を開始しました！" if bool(panel.get("mention_everyone", False)) else ""
+        msg = await interaction.channel.send(content=content, embed=build_panel_embed(panel, slots), view=SlotsView(panel_id, slots))
+
+        # message_id保存
+        try:
+            await db_to_thread(lambda: update_panel_message_id(panel_id, str(msg.id)))
+        except Exception:
+            pass
+
+        # ドラフト消す
+        draft.pop(self.key, None)
+
+        await interaction.followup.send("✅ 募集パネルを投稿した！", ephemeral=True)
+
+
+# =========================================================
+# COMMAND
+# =========================================================
+@tree.command(name="setup", description="募集パネルを作る（準備画面は自分だけ）")
+async def setup_cmd(interaction: discord.Interaction):
     key = dkey(interaction)
 
-    # 初期値：今日がデフォ
     draft[key] = {
         "step": 1,
-        "day_key": "today",
-        "start_h": None, "start_m": None,
-        "end_h": None, "end_m": None,
+        "day_key": "today",      # 初期は今日
+        "start_h": None,
+        "start_m": None,
+        "end_h": None,           # 24まで許可
+        "end_m": None,
         "interval_minutes": None,
         "title": "無題",
         "mention_everyone": False,
-        "notify_channel_id": None,  # 3分前通知先（未選択=このチャンネル）
+        "notify_channel_id": None,  # 3分前通知用（未選択=このチャンネル）
     }
 
     st = draft[key]
     await interaction.response.send_message(
-        "ボタン/セレクトで設定してね👇",
+        "設定して「作成」してね👇（この画面は自分だけ見える）",
         embed=build_setup_embed(st),
-        view=SetupView(st, interaction.message if interaction.message else None),  # type: ignore
+        view=SetupWizardView(key),
         ephemeral=True,
     )
 
 
-@tree.command(name="generate", description="保存した設定から枠ボタンを生成して投稿")
-async def generate(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-
-    guild_id = str(interaction.guild_id)
-
-    # today 固定じゃなく、保存されてる day_key で作りたいならここを選択式にできる（今は today）
-    day_key = "today"
-
-    # panels 取得
-    try:
-        pres = await db_to_thread(lambda: get_panel(guild_id, day_key))
-    except Exception as e:
-        return await interaction.followup.send(f"❌ panels 取得失敗: {e}", ephemeral=True)
-
-    if not pres.data:
-        return await interaction.followup.send("❌ 先に /setup → 作成 をしてね", ephemeral=True)
-
-    panel = pres.data[0]
-    panel_id = int(panel["id"])
-
-    start_hm = panel.get("start_hm")
-    end_hm = panel.get("end_hm")
-    interval = int(panel.get("interval_minutes", 30))
-
-    if not start_hm or not end_hm:
-        return await interaction.followup.send("❌ 開始/終了が保存されてない。/setup からやり直してね", ephemeral=True)
-
-    d = to_panel_day(panel.get("day_key", "today"))
-    start_dt = make_dt_jst(d, start_hm)
-    end_dt = make_dt_jst(d, end_hm)
-
-    # 日跨ぎ対応（例: 23:00 → 01:00）
-    if end_dt <= start_dt:
-        end_dt = end_dt + timedelta(days=1)
-
-    # 既存slot削除（重複対策）
-    try:
-        await db_to_thread(lambda: delete_slots(panel_id))
-    except Exception as e:
-        return await interaction.followup.send(f"❌ 既存slots削除失敗: {e}", ephemeral=True)
-
-    # slots 生成
-    rows = []
-    cur = start_dt
-    while cur < end_dt:
-        nxt = cur + timedelta(minutes=interval)
-        rows.append({
-            "panel_id": panel_id,
-            "start_at": cur.astimezone(timezone.utc).isoformat(),
-            "end_at": nxt.astimezone(timezone.utc).isoformat(),
-            "slot_time": slot_time_str(cur),  # NOT NULL
-            "is_break": False,               # NOT NULL
-            "notified": False,               # NOT NULL
-            "reserved_by": None,
-            "reserver_user_id": None,
-            "reserver_name": None,
-            "reserved_at": None,
-        })
-        cur = nxt
-
-    try:
-        ins = await db_to_thread(lambda: insert_slots(rows))
-    except Exception as e:
-        return await interaction.followup.send(f"❌ slots 作成失敗: {e}", ephemeral=True)
-
-    slots = ins.data or []
-    if not slots:
-        return await interaction.followup.send("❌ slots が作れなかった（slots列/NOT NULL を確認）", ephemeral=True)
-
-    # パネルを投稿する場所（＝setupを打ったチャンネル or いまのチャンネル）
-    post_channel_id = panel.get("channel_id") or str(interaction.channel_id)
-    ch = interaction.guild.get_channel(int(post_channel_id)) or interaction.channel  # type: ignore
-
-    msg = await ch.send(embed=build_panel_embed(panel, slots), view=SlotsView(panel_id, slots))  # type: ignore
-
-    # panels に panel_message_id 保存（あれば）
-    try:
-        await db_to_thread(lambda: sb.table("panels").update({"panel_message_id": str(msg.id)}).eq("id", panel_id).execute())
-    except Exception:
-        pass
-
-    await interaction.followup.send("✅ 枠ボタンを生成して投稿した！", ephemeral=True)
-
-
-@tree.command(name="reset", description="今日/明日の募集を削除（slotsも消す）")
-@app_commands.describe(day="today か tomorrow")
-async def reset(interaction: discord.Interaction, day: str = "today"):
-    await interaction.response.defer(ephemeral=True)
-
-    if day not in ("today", "tomorrow"):
-        return await interaction.followup.send("❌ day は today / tomorrow のどっちか", ephemeral=True)
-
-    guild_id = str(interaction.guild_id)
-    try:
-        pres = await db_to_thread(lambda: get_panel(guild_id, day))
-    except Exception as e:
-        return await interaction.followup.send(f"❌ panels取得失敗: {e}", ephemeral=True)
-
-    if not pres.data:
-        return await interaction.followup.send("✅ その日の panels は無いよ（何もしない）", ephemeral=True)
-
-    panel = pres.data[0]
-    panel_id = int(panel["id"])
-
-    try:
-        await db_to_thread(lambda: delete_slots(panel_id))
-        await db_to_thread(lambda: sb.table("panels").delete().eq("id", panel_id).execute())
-    except Exception as e:
-        return await interaction.followup.send(f"❌ 削除失敗: {e}", ephemeral=True)
-
-    await interaction.followup.send(f"✅ {day_label(day)} を削除した！", ephemeral=True)
-
-
-# ========= lifecycle =========
 @client.event
 async def on_ready():
     await tree.sync()
@@ -659,8 +695,7 @@ async def on_ready():
 
 
 async def main():
-    # 429対策：起動直後の連打を避ける
-    await asyncio.sleep(5)
+    await asyncio.sleep(2)
     await client.start(TOKEN)
 
 
