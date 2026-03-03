@@ -533,7 +533,7 @@ async def setup(interaction: discord.Interaction):
         "ボタン/セレクトで設定してね👇",
         embed=build_setup_embed(st),
         view=SetupView(st, interaction.message if interaction.message else None),  # type: ignore
-        ephemeral=False,
+        ephemeral=True,
     )
 
 
