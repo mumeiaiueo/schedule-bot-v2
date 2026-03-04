@@ -1151,11 +1151,12 @@ async def reminder_loop():
                 if not enabled:
                     continue
 
+                # ✅ ここが重要：reserved_by 条件を修正
                 sres = await db_to_thread(
                     lambda: sb.table("slots")
                     .select("id,start_at,end_at,reserved_by,notified,is_break")
                     .eq("panel_id", panel_id)
-                    .is_("reserved_by", "not.null")
+                    .not_.is_("reserved_by", "null")  # ✅ 修正点
                     .eq("notified", False)
                     .eq("is_break", False)
                     .gte("start_at", now.isoformat())
@@ -1193,6 +1194,11 @@ async def reminder_loop():
                             en_dt = parse_iso(t["end_at"])
 
                     ch = client.get_channel(int(notify_channel_id))
+                    if ch is None:
+                        try:
+                            ch = await client.fetch_channel(int(notify_channel_id))
+                        except Exception:
+                            ch = None
                     if ch is None:
                         continue
 
