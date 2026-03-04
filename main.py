@@ -37,6 +37,9 @@ draft: dict[tuple[str, str], dict] = {}
 # notify_enabled 列が無いときの暫定保存（panel_id -> bool）
 _notify_cache: dict[int, bool] = {}
 
+# パネルの「今どのページ見てたか」キャッシュ（panel_id -> page）
+_panel_page_cache: dict[int, int] = {}
+
 # panel編集の連打抑制
 _panel_locks: dict[int, asyncio.Lock] = {}
 _panel_last_edit: dict[int, float] = {}
@@ -45,6 +48,9 @@ _panel_last_edit: dict[int, float] = {}
 # =========================================================
 # Helpers
 # =========================================================
+PER_PAGE = 20  # 1ページの枠ボタン数（20が安全：管理ボタン5で合計25）
+
+
 def dkey(interaction: discord.Interaction) -> tuple[str, str]:
     return (str(interaction.guild_id), str(interaction.user.id))
 
@@ -72,11 +78,11 @@ def ensure_lock(panel_id: int) -> asyncio.Lock:
     return lock
 
 
+def clamp(n: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, n))
+
+
 def _extract_missing_column(exc: Exception) -> str | None:
-    """
-    Supabase / PostgREST の PGRST204（schema cache）から
-    'xxx' column を抜く
-    """
     msg = ""
     if hasattr(exc, "message"):
         try:
@@ -141,9 +147,6 @@ def db_get_manager_role_id(guild_id: str):
 
 
 def db_upsert_panel_safe(row: dict):
-    """
-    panels に upsert。存在しない列があれば削って再試行（PGRST204対策）
-    """
     payload = dict(row)
     removed = set()
     for _ in range(12):
@@ -239,7 +242,7 @@ def build_setup_embed(st: dict) -> discord.Embed:
         e.add_field(name="タイトル", value=title, inline=False)
 
         notify_id = st.get("notify_channel_id")
-        notify_label = st.get("notify_channel_label")  # "#general" など
+        notify_label = st.get("notify_channel_label")
         show = f"<#{notify_id}>" if notify_id else "未選択=このチャンネル"
         if notify_label:
             show = f"{notify_label} / {show}"
@@ -307,7 +310,6 @@ def build_setup_view(st: dict) -> discord.ui.View:
     step = int(st.get("step") or 1)
     v = discord.ui.View(timeout=600)
 
-    # day buttons
     day_key = st.get("day_key", "today")
     v.add_item(NoopButton(
         label="今日",
@@ -342,7 +344,7 @@ def build_setup_view(st: dict) -> discord.ui.View:
             min_values=1, max_values=1,
             row=2,
         ))
-        # ★ 終了(時)だけ 24 を追加（24:00対応）
+        # 終了(時)は 24 を追加（24:00対応）
         v.add_item(NoopSelect(
             custom_id="setup:end_h",
             placeholder=f"終了(時) 現在:{(f'{eh:02d}' if eh is not None else '--')}",
@@ -359,7 +361,6 @@ def build_setup_view(st: dict) -> discord.ui.View:
         ))
         return v
 
-    # step 2
     interval = st.get("interval_minutes")
     v.add_item(NoopSelect(
         custom_id="setup:interval",
@@ -380,7 +381,6 @@ def build_setup_view(st: dict) -> discord.ui.View:
     ev_label = "@everyone ON" if ev_on else "@everyone OFF"
     v.add_item(NoopButton(label=ev_label, style=ev_style, custom_id="setup:everyone", row=2))
 
-    # ★ B: 通知チャンネル選択後、選んだチャンネル名をplaceholderに表示
     notify_label = st.get("notify_channel_label")
     ph = "通知チャンネル（未選択=このチャンネル）"
     if notify_label:
@@ -399,15 +399,24 @@ def build_setup_view(st: dict) -> discord.ui.View:
 
 
 # =========================================================
-# Panel Embed & View
+# Panel Embed & View（ページ切替）
 # =========================================================
-def build_panel_embed(title: str, day_key: str, interval: int, slots: list[dict]) -> discord.Embed:
+def build_panel_embed(title: str, day_key: str, interval: int, slots: list[dict], page: int) -> discord.Embed:
     e = discord.Embed(title=title or "募集パネル", color=0x2B2D31)
     day_label = "今日" if day_key == "today" else "明日"
-    e.description = f"📅 {day_label}（JST） / interval {interval}min"
+
+    total = len(slots)
+    max_page = max(0, (total - 1) // PER_PAGE)
+    page = clamp(page, 0, max_page)
+
+    e.description = f"📅 {day_label}（JST） / interval {interval}min\nページ {page+1}/{max_page+1}（全{total}枠）"
+
+    start_i = page * PER_PAGE
+    end_i = min(total, start_i + PER_PAGE)
+    part = slots[start_i:end_i]
 
     lines = []
-    for s in slots[:30]:
+    for s in part:
         t = s.get("slot_time") or "??:??"
         is_break = bool(s.get("is_break", False))
         reserved_by = s.get("reserved_by")
@@ -418,23 +427,31 @@ def build_panel_embed(title: str, day_key: str, interval: int, slots: list[dict]
         else:
             lines.append(f"🟢 {t}")
 
-    e.add_field(name="枠", value="\n".join(lines) if lines else "なし", inline=False)
+    e.add_field(name="表示中の枠", value="\n".join(lines) if lines else "なし", inline=False)
     e.set_footer(text="🟢空き / 🔴予約済み（本人は押すとキャンセル） / ⚪休憩（予約不可）")
     return e
 
 
-def build_panel_view(panel_id: int, slots: list[dict], notify_enabled: bool) -> discord.ui.View:
+def build_panel_view(panel_id: int, slots: list[dict], notify_enabled: bool, page: int) -> discord.ui.View:
     v = discord.ui.View(timeout=None)
 
-    # 枠ボタン（最大20）row0..3（5個ずつ）
-    for i, s in enumerate(slots[:20]):
+    total = len(slots)
+    max_page = max(0, (total - 1) // PER_PAGE)
+    page = clamp(page, 0, max_page)
+
+    start_i = page * PER_PAGE
+    end_i = min(total, start_i + PER_PAGE)
+    part = slots[start_i:end_i]
+
+    # 20枠 = row0..3 だけで完結
+    for i, s in enumerate(part):
         t = s.get("slot_time") or "??:??"
         is_break = bool(s.get("is_break", False))
         reserved_by = s.get("reserved_by")
 
         if is_break:
             style = discord.ButtonStyle.secondary
-            disabled = True  # ★休憩は押せない（灰色）
+            disabled = True
         elif reserved_by:
             style = discord.ButtonStyle.danger
             disabled = False
@@ -447,20 +464,29 @@ def build_panel_view(panel_id: int, slots: list[dict], notify_enabled: bool) -> 
             label=t,
             style=style,
             disabled=disabled,
-            custom_id=f"slot:{panel_id}:{int(s['id'])}",
+            custom_id=f"slot:{panel_id}:{int(s['id'])}:{page}",
             row=row
         ))
 
-    # 下部操作 row4
+    # row4（5個ぴったり）
+    prev_disabled = (page <= 0)
+    next_disabled = (page >= max_page)
+
+    v.add_item(NoopButton(label="◀ 前へ", style=discord.ButtonStyle.secondary, disabled=prev_disabled,
+                          custom_id=f"page:{panel_id}:{page-1}", row=4))
+    v.add_item(NoopButton(label="次へ ▶", style=discord.ButtonStyle.secondary, disabled=next_disabled,
+                          custom_id=f"page:{panel_id}:{page+1}", row=4))
+
     n_label = "🔔 通知ON" if notify_enabled else "🔕 通知OFF"
     n_style = discord.ButtonStyle.success if notify_enabled else discord.ButtonStyle.secondary
-    v.add_item(NoopButton(label=n_label, style=n_style, custom_id=f"notify:{panel_id}", row=4))
-    v.add_item(NoopButton(label="🛠 休憩切替", style=discord.ButtonStyle.secondary, custom_id=f"break:{panel_id}", row=4))
-    v.add_item(NoopButton(label="🗑 削除", style=discord.ButtonStyle.danger, custom_id=f"del:{panel_id}", row=4))
+    v.add_item(NoopButton(label=n_label, style=n_style, custom_id=f"notify:{panel_id}:{page}", row=4))
+    v.add_item(NoopButton(label="🛠 休憩切替", style=discord.ButtonStyle.secondary, custom_id=f"break:{panel_id}:{page}", row=4))
+    v.add_item(NoopButton(label="🗑 削除", style=discord.ButtonStyle.danger, custom_id=f"del:{panel_id}:{page}", row=4))
+
     return v
 
 
-async def refresh_panel_message(message: discord.Message, panel_id: int):
+async def refresh_panel_message(message: discord.Message, panel_id: int, page: int | None = None):
     lock = ensure_lock(panel_id)
     async with lock:
         now = asyncio.get_event_loop().time()
@@ -486,20 +512,27 @@ async def refresh_panel_message(message: discord.Message, panel_id: int):
         else:
             notify_enabled = bool(_notify_cache.get(panel_id, True))
 
+        total = len(slots)
+        max_page = max(0, (total - 1) // PER_PAGE)
+        if page is None:
+            page = _panel_page_cache.get(panel_id, 0)
+        page = clamp(int(page), 0, max_page)
+        _panel_page_cache[panel_id] = page
+
         try:
             await message.edit(
-                embed=build_panel_embed(title, day_key, interval, slots),
-                view=build_panel_view(panel_id, slots, notify_enabled),
+                embed=build_panel_embed(title, day_key, interval, slots, page),
+                view=build_panel_view(panel_id, slots, notify_enabled, page),
             )
             _panel_last_edit[panel_id] = asyncio.get_event_loop().time()
         except Exception:
             pass
 
 
-async def refresh_panel_message_by_panel_id(panel_id: int, guild: discord.Guild | None, fallback_message: discord.Message | None = None):
+async def refresh_panel_message_by_panel_id(panel_id: int, guild: discord.Guild | None, fallback_message: discord.Message | None = None, page: int | None = None):
     if fallback_message is not None:
         try:
-            await refresh_panel_message(fallback_message, panel_id)
+            await refresh_panel_message(fallback_message, panel_id, page=page)
             return
         except Exception:
             pass
@@ -523,13 +556,10 @@ async def refresh_panel_message_by_panel_id(panel_id: int, guild: discord.Guild 
     except Exception:
         return
 
-    await refresh_panel_message(msg, panel_id)
+    await refresh_panel_message(msg, panel_id, page=page)
 
 
-# =========================================================
-# Break select (ephemeral)
-# =========================================================
-def build_break_select_view(panel_id: int, slots: list[dict]) -> discord.ui.View:
+def build_break_select_view(panel_id: int, slots: list[dict], page: int) -> discord.ui.View:
     opts: list[discord.SelectOption] = []
     for s in slots[:25]:
         t = s.get("slot_time") or "??:??"
@@ -546,7 +576,7 @@ def build_break_select_view(panel_id: int, slots: list[dict]) -> discord.ui.View
 
     v = discord.ui.View(timeout=120)
     v.add_item(NoopSelect(
-        custom_id=f"breaksel:{panel_id}",
+        custom_id=f"breaksel:{panel_id}:{page}",
         placeholder="休憩にする/解除する枠を選択",
         options=opts,
         min_values=1, max_values=1,
@@ -556,7 +586,7 @@ def build_break_select_view(panel_id: int, slots: list[dict]) -> discord.ui.View
 
 
 # =========================================================
-# Setup -> Create flow
+# Setup -> Create
 # =========================================================
 async def do_create_panel(interaction: discord.Interaction, st: dict):
     sh, sm = st.get("start_h"), st.get("start_m")
@@ -578,7 +608,7 @@ async def do_create_panel(interaction: discord.Interaction, st: dict):
 
     start_dt = datetime(base.year, base.month, base.day, int(sh), int(sm), tzinfo=JST)
 
-    # ★ 24:00 対応（終了が 24:00 のときは翌日0:00扱い）
+    # 24:00対応
     if int(eh) == 24:
         if int(em) != 0:
             await interaction.followup.send("❌ 終了が24時の場合、分は00しか選べません", ephemeral=True)
@@ -588,7 +618,6 @@ async def do_create_panel(interaction: discord.Interaction, st: dict):
     else:
         end_dt = datetime(base.year, base.month, base.day, int(eh), int(em), tzinfo=JST)
 
-    # 日跨ぎ（例: 23:00→01:00）
     if end_dt <= start_dt:
         end_dt = end_dt + timedelta(days=1)
 
@@ -600,7 +629,7 @@ async def do_create_panel(interaction: discord.Interaction, st: dict):
         "interval_minutes": int(interval),
         "notify_channel_id": str(notify_channel_id),     # 3分前通知先
         "mention_everyone": bool(mention_everyone),
-        "notify_enabled": True,                          # 列が無ければ安全に落ちる
+        "notify_enabled": True,                          # 列が無ければ自動で捨てる
         "created_by": str(interaction.user.id),
         "created_at": datetime.now(UTC).isoformat(),
     }
@@ -621,8 +650,8 @@ async def do_create_panel(interaction: discord.Interaction, st: dict):
 
     panel_id = int(panel["id"])
     _notify_cache.setdefault(panel_id, True)
+    _panel_page_cache[panel_id] = 0
 
-    # slots作成：既存削除→作成
     try:
         await db_to_thread(lambda: db_delete_slots(panel_id))
     except Exception:
@@ -643,42 +672,37 @@ async def do_create_panel(interaction: discord.Interaction, st: dict):
         cur += timedelta(minutes=int(interval))
 
     try:
-        ins = await db_to_thread(lambda: db_insert_slots_safe(slot_rows))
+        await db_to_thread(lambda: db_insert_slots_safe(slot_rows))
     except Exception as e:
         await interaction.followup.send(f"❌ slots 作成失敗: {e}", ephemeral=True)
         return
 
-    created = ins.data or []
-    if not created:
-        sres = await db_to_thread(lambda: db_get_slots(panel_id))
-        created = sres.data or []
-    if not created:
+    sres = await db_to_thread(lambda: db_get_slots(panel_id))
+    slots = sres.data or []
+    if not slots:
         await interaction.followup.send("❌ slots が作れなかった（slots列/制約を確認）", ephemeral=True)
         return
 
-    # 公開パネル投稿（既存 message があれば編集、無ければ新規）
-    ch = interaction.channel
     old_mid = panel.get("panel_message_id")
-
     notify_enabled = True
     if panel.get("notify_enabled") is not None:
         notify_enabled = bool(panel.get("notify_enabled"))
     else:
         notify_enabled = bool(_notify_cache.get(panel_id, True))
 
-    embed = build_panel_embed(title, day_key, int(interval), created)
-    view = build_panel_view(panel_id, created, notify_enabled)
+    embed = build_panel_embed(title, day_key, int(interval), slots, page=0)
+    view = build_panel_view(panel_id, slots, notify_enabled, page=0)
 
     msg = None
     if old_mid:
         try:
-            msg = await ch.fetch_message(int(old_mid))
+            msg = await interaction.channel.fetch_message(int(old_mid))
             await msg.edit(content=None, embed=embed, view=view)
         except Exception:
             msg = None
 
     if msg is None:
-        msg = await ch.send(
+        msg = await interaction.channel.send(
             content=f"📅 **{title}**（{'今日' if day_key=='today' else '明日'}） / interval {interval}min\n下のボタンで予約してね👇",
             embed=embed,
             view=view,
@@ -689,10 +713,9 @@ async def do_create_panel(interaction: discord.Interaction, st: dict):
     except Exception:
         pass
 
-    # 作成時 @everyone 1回だけ
     if mention_everyone:
         try:
-            await ch.send("@everyone 募集を開始しました！")
+            await interaction.channel.send("@everyone 募集を開始しました！")
         except Exception:
             pass
         try:
@@ -712,7 +735,7 @@ async def setup(interaction: discord.Interaction):
     key = dkey(interaction)
     draft[key] = {
         "step": 1,
-        "day_key": "today",          # 初期は今日（選ばなくてOK）
+        "day_key": "today",
         "start_h": None, "start_m": None,
         "end_h": None, "end_m": None,
         "interval_minutes": None,
@@ -788,12 +811,13 @@ async def on_interaction(interaction: discord.Interaction):
                 return
             return
 
-        # Components
+        # Components only
         if interaction.type != discord.InteractionType.component:
             return
 
         data = interaction.data or {}
         cid = data.get("custom_id") or ""
+        values = data.get("values") or []
 
         # -----------------------
         # Setup wizard
@@ -805,13 +829,10 @@ async def on_interaction(interaction: discord.Interaction):
                 await interaction.response.send_message("❌ 状態がありません。/setup をやり直してね", ephemeral=True)
                 return
 
-            values = data.get("values") or []
-
             if cid == "setup:day:today":
                 st["day_key"] = "today"
             elif cid == "setup:day:tomorrow":
                 st["day_key"] = "tomorrow"
-
             elif cid == "setup:start_h" and values:
                 st["start_h"] = int(values[0])
             elif cid == "setup:start_m" and values:
@@ -822,14 +843,11 @@ async def on_interaction(interaction: discord.Interaction):
                 st["end_m"] = int(values[0])
             elif cid == "setup:interval" and values:
                 st["interval_minutes"] = int(values[0])
-
             elif cid == "setup:title":
                 await interaction.response.send_modal(TitleModal(st))
                 return
-
             elif cid == "setup:everyone":
                 st["mention_everyone"] = not bool(st.get("mention_everyone", False))
-
             elif cid == "setup:notify_channel" and values:
                 ch_id = str(values[0])
                 st["notify_channel_id"] = ch_id
@@ -842,21 +860,15 @@ async def on_interaction(interaction: discord.Interaction):
                 except Exception:
                     label = None
                 st["notify_channel_label"] = label
-
             elif cid == "setup:next":
                 sh, sm = st.get("start_h"), st.get("start_m")
                 eh, em = st.get("end_h"), st.get("end_m")
                 if None in (sh, sm, eh, em):
                     await interaction.response.send_message("❌ まず開始/終了を全部選んでね", ephemeral=True)
                     return
-                if int(sh) == int(eh) and int(sm) == int(em):
-                    await interaction.response.send_message("❌ 開始と終了が同じです", ephemeral=True)
-                    return
                 st["step"] = 2
-
             elif cid == "setup:back":
                 st["step"] = 1
-
             elif cid == "setup:create":
                 await interaction.response.defer(ephemeral=True)
                 await do_create_panel(interaction, st)
@@ -877,14 +889,40 @@ async def on_interaction(interaction: discord.Interaction):
             return
 
         # -----------------------
-        # Panel components
+        # Page navigation
+        # -----------------------
+        if cid.startswith("page:"):
+            # page:{panel_id}:{page}
+            parts = cid.split(":")
+            if len(parts) < 3:
+                return
+            panel_id = int(parts[1])
+            page = int(parts[2])
+
+            _panel_page_cache[panel_id] = max(0, page)
+
+            # ACKだけしてから編集（安全）
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.defer()
+            except Exception:
+                pass
+
+            await refresh_panel_message_by_panel_id(panel_id, interaction.guild, fallback_message=interaction.message, page=page)
+            return
+
+        # -----------------------
+        # Slot reserve
         # -----------------------
         if cid.startswith("slot:"):
+            # slot:{panel_id}:{slot_id}:{page?}
             parts = cid.split(":")
             if len(parts) < 3:
                 return
             panel_id = int(parts[1])
             slot_id = int(parts[2])
+            page = int(parts[3]) if len(parts) >= 4 and parts[3].isdigit() else _panel_page_cache.get(panel_id, 0)
+            _panel_page_cache[panel_id] = page
 
             await interaction.response.defer(ephemeral=True)
 
@@ -923,11 +961,18 @@ async def on_interaction(interaction: discord.Interaction):
                     return
                 await interaction.followup.send("✅ 予約したよ！", ephemeral=True)
 
-            await refresh_panel_message_by_panel_id(panel_id, interaction.guild, fallback_message=interaction.message)
+            await refresh_panel_message_by_panel_id(panel_id, interaction.guild, fallback_message=interaction.message, page=page)
             return
 
+        # -----------------------
+        # Notify toggle
+        # -----------------------
         if cid.startswith("notify:"):
-            panel_id = int(cid.split(":")[1])
+            # notify:{panel_id}:{page?}
+            parts = cid.split(":")
+            panel_id = int(parts[1])
+            page = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else _panel_page_cache.get(panel_id, 0)
+            _panel_page_cache[panel_id] = page
 
             if not await is_manager(interaction):
                 await interaction.response.send_message("❌ 管理者/管理ロールのみ操作できます", ephemeral=True)
@@ -951,11 +996,18 @@ async def on_interaction(interaction: discord.Interaction):
                 new_val = not cur
 
             await interaction.followup.send(f"✅ 通知を {'ON' if new_val else 'OFF'} にした", ephemeral=True)
-            await refresh_panel_message_by_panel_id(panel_id, interaction.guild, fallback_message=interaction.message)
+            await refresh_panel_message_by_panel_id(panel_id, interaction.guild, fallback_message=interaction.message, page=page)
             return
 
+        # -----------------------
+        # Break toggle
+        # -----------------------
         if cid.startswith("break:"):
-            panel_id = int(cid.split(":")[1])
+            # break:{panel_id}:{page?}
+            parts = cid.split(":")
+            panel_id = int(parts[1])
+            page = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else _panel_page_cache.get(panel_id, 0)
+            _panel_page_cache[panel_id] = page
 
             if not await is_manager(interaction):
                 await interaction.response.send_message("❌ 管理者/管理ロールのみ操作できます", ephemeral=True)
@@ -969,11 +1021,16 @@ async def on_interaction(interaction: discord.Interaction):
                 await interaction.followup.send("❌ 枠がない", ephemeral=True)
                 return
 
-            await interaction.followup.send("休憩にする/解除する枠を選んでね👇", view=build_break_select_view(panel_id, slots), ephemeral=True)
+            await interaction.followup.send("休憩にする/解除する枠を選んでね👇", view=build_break_select_view(panel_id, slots, page), ephemeral=True)
             return
 
+        # break select
         if cid.startswith("breaksel:"):
-            panel_id = int(cid.split(":")[1])
+            # breaksel:{panel_id}:{page}
+            parts = cid.split(":")
+            panel_id = int(parts[1])
+            page = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else _panel_page_cache.get(panel_id, 0)
+            _panel_page_cache[panel_id] = page
 
             if not await is_manager(interaction):
                 await interaction.response.send_message("❌ 管理者/管理ロールのみ操作できます", ephemeral=True)
@@ -981,7 +1038,6 @@ async def on_interaction(interaction: discord.Interaction):
 
             await interaction.response.defer(ephemeral=True)
 
-            values = data.get("values") or []
             if not values:
                 await interaction.followup.send("❌ 選択がない", ephemeral=True)
                 return
@@ -1001,12 +1057,17 @@ async def on_interaction(interaction: discord.Interaction):
             await db_to_thread(lambda: db_update_slot_safe(slot_id, {"is_break": (not now_break)}))
             await interaction.followup.send(f"✅ {'休憩にした' if (not now_break) else '休憩解除した'}", ephemeral=True)
 
-            # ★ ここが修正点：ephemeralのinteraction.messageではなく、DBのpanel_message_id側を更新
-            await refresh_panel_message_by_panel_id(panel_id, interaction.guild, fallback_message=None)
+            # 公開パネルを更新（ページ維持）
+            await refresh_panel_message_by_panel_id(panel_id, interaction.guild, fallback_message=None, page=page)
             return
 
+        # delete
         if cid.startswith("del:"):
-            panel_id = int(cid.split(":")[1])
+            # del:{panel_id}:{page?}
+            parts = cid.split(":")
+            panel_id = int(parts[1])
+            page = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else _panel_page_cache.get(panel_id, 0)
+            _panel_page_cache[panel_id] = page
 
             if not await is_manager(interaction):
                 await interaction.response.send_message("❌ 管理者/管理ロールのみ操作できます", ephemeral=True)
@@ -1154,7 +1215,7 @@ async def reminder_loop():
 
 
 # =========================================================
-# READY
+# READY / RUN
 # =========================================================
 @client.event
 async def on_ready():
