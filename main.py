@@ -44,7 +44,6 @@ _panel_page_cache: dict[int, int] = {}
 _panel_locks: dict[int, asyncio.Lock] = {}
 _panel_last_edit: dict[int, float] = {}
 
-
 # =========================================================
 # Helpers
 # =========================================================
@@ -344,7 +343,6 @@ def build_setup_view(st: dict) -> discord.ui.View:
             min_values=1, max_values=1,
             row=2,
         ))
-        # 終了(時)は 24 を追加（24:00対応）
         v.add_item(NoopSelect(
             custom_id="setup:end_h",
             placeholder=f"終了(時) 現在:{(f'{eh:02d}' if eh is not None else '--')}",
@@ -443,7 +441,6 @@ def build_panel_view(panel_id: int, slots: list[dict], notify_enabled: bool, pag
     end_i = min(total, start_i + PER_PAGE)
     part = slots[start_i:end_i]
 
-    # 20枠 = row0..3 だけで完結
     for i, s in enumerate(part):
         t = s.get("slot_time") or "??:??"
         is_break = bool(s.get("is_break", False))
@@ -468,14 +465,23 @@ def build_panel_view(panel_id: int, slots: list[dict], notify_enabled: bool, pag
             row=row
         ))
 
-    # row4（5個ぴったり）
     prev_disabled = (page <= 0)
     next_disabled = (page >= max_page)
 
-    v.add_item(NoopButton(label="◀ 前へ", style=discord.ButtonStyle.secondary, disabled=prev_disabled,
-                          custom_id=f"page:{panel_id}:{page-1}", row=4))
-    v.add_item(NoopButton(label="次へ ▶", style=discord.ButtonStyle.secondary, disabled=next_disabled,
-                          custom_id=f"page:{panel_id}:{page+1}", row=4))
+    v.add_item(NoopButton(
+        label="◀ 前へ",
+        style=discord.ButtonStyle.secondary,
+        disabled=prev_disabled,
+        custom_id=f"page:{panel_id}:{page-1}",
+        row=4
+    ))
+    v.add_item(NoopButton(
+        label="次へ ▶",
+        style=discord.ButtonStyle.secondary,
+        disabled=next_disabled,
+        custom_id=f"page:{panel_id}:{page+1}",
+        row=4
+    ))
 
     n_label = "🔔 通知ON" if notify_enabled else "🔕 通知OFF"
     n_style = discord.ButtonStyle.success if notify_enabled else discord.ButtonStyle.secondary
@@ -489,10 +495,10 @@ def build_panel_view(panel_id: int, slots: list[dict], notify_enabled: bool, pag
 async def refresh_panel_message(message: discord.Message, panel_id: int, page: int | None = None):
     lock = ensure_lock(panel_id)
     async with lock:
-        now = asyncio.get_event_loop().time()
+        now_loop = asyncio.get_event_loop().time()
         last = _panel_last_edit.get(panel_id, 0.0)
-        if now - last < 1.0:
-            await asyncio.sleep(1.0 - (now - last))
+        if now_loop - last < 1.0:
+            await asyncio.sleep(1.0 - (now_loop - last))
 
         pres = await db_to_thread(lambda: db_get_panel_by_id(panel_id))
         if not pres.data:
@@ -525,17 +531,22 @@ async def refresh_panel_message(message: discord.Message, panel_id: int, page: i
                 view=build_panel_view(panel_id, slots, notify_enabled, page),
             )
             _panel_last_edit[panel_id] = asyncio.get_event_loop().time()
-        except Exception:
-            pass
+        except Exception as e:
+            print("⚠️ refresh_panel_message edit error:", repr(e))
 
 
-async def refresh_panel_message_by_panel_id(panel_id: int, guild: discord.Guild | None, fallback_message: discord.Message | None = None, page: int | None = None):
+async def refresh_panel_message_by_panel_id(
+    panel_id: int,
+    guild: discord.Guild | None,
+    fallback_message: discord.Message | None = None,
+    page: int | None = None
+):
     if fallback_message is not None:
         try:
             await refresh_panel_message(fallback_message, panel_id, page=page)
             return
-        except Exception:
-            pass
+        except Exception as e:
+            print("⚠️ refresh_panel_message_by_panel_id fallback error:", repr(e))
 
     pres = await db_to_thread(lambda: db_get_panel_by_id(panel_id))
     if not pres.data:
@@ -553,7 +564,8 @@ async def refresh_panel_message_by_panel_id(panel_id: int, guild: discord.Guild 
 
     try:
         msg = await ch.fetch_message(int(message_id))
-    except Exception:
+    except Exception as e:
+        print("⚠️ fetch panel message error:", repr(e))
         return
 
     await refresh_panel_message(msg, panel_id, page=page)
@@ -608,7 +620,6 @@ async def do_create_panel(interaction: discord.Interaction, st: dict):
 
     start_dt = datetime(base.year, base.month, base.day, int(sh), int(sm), tzinfo=JST)
 
-    # 24:00対応
     if int(eh) == 24:
         if int(em) != 0:
             await interaction.followup.send("❌ 終了が24時の場合、分は00しか選べません", ephemeral=True)
@@ -623,13 +634,13 @@ async def do_create_panel(interaction: discord.Interaction, st: dict):
 
     row = {
         "guild_id": str(interaction.guild_id),
-        "channel_id": str(interaction.channel_id),       # 公開パネル投稿先
+        "channel_id": str(interaction.channel_id),
         "day_key": day_key,
         "title": title,
         "interval_minutes": int(interval),
-        "notify_channel_id": str(notify_channel_id),     # 3分前通知先
+        "notify_channel_id": str(notify_channel_id),
         "mention_everyone": bool(mention_everyone),
-        "notify_enabled": True,                          # 列が無ければ自動で捨てる
+        "notify_enabled": True,
         "created_by": str(interaction.user.id),
         "created_at": datetime.now(UTC).isoformat(),
     }
@@ -703,7 +714,7 @@ async def do_create_panel(interaction: discord.Interaction, st: dict):
 
     if msg is None:
         msg = await interaction.channel.send(
-            content=f"📅 **{title}**（{'今日' if day_key=='today' else '明日'}） / interval {interval}min\n下のボタンで予約してね👇",
+            content=f"📅 **{title}**（{'今日' if day_key == 'today' else '明日'}） / interval {interval}min\n下のボタンで予約してね👇",
             embed=embed,
             view=view,
         )
@@ -780,12 +791,10 @@ async def manager_role(interaction: discord.Interaction, role: discord.Role | No
 @client.event
 async def on_interaction(interaction: discord.Interaction):
     try:
-        # Slash commands
         if interaction.type == discord.InteractionType.application_command:
             await tree._call(interaction)
             return
 
-        # Modal submit
         if interaction.type == discord.InteractionType.modal_submit:
             data = interaction.data or {}
             cid = data.get("custom_id") or ""
@@ -811,7 +820,6 @@ async def on_interaction(interaction: discord.Interaction):
                 return
             return
 
-        # Components only
         if interaction.type != discord.InteractionType.component:
             return
 
@@ -892,7 +900,6 @@ async def on_interaction(interaction: discord.Interaction):
         # Page navigation
         # -----------------------
         if cid.startswith("page:"):
-            # page:{panel_id}:{page}
             parts = cid.split(":")
             if len(parts) < 3:
                 return
@@ -901,7 +908,6 @@ async def on_interaction(interaction: discord.Interaction):
 
             _panel_page_cache[panel_id] = max(0, page)
 
-            # ACKだけしてから編集（安全）
             try:
                 if not interaction.response.is_done():
                     await interaction.response.defer()
@@ -915,7 +921,6 @@ async def on_interaction(interaction: discord.Interaction):
         # Slot reserve
         # -----------------------
         if cid.startswith("slot:"):
-            # slot:{panel_id}:{slot_id}:{page?}
             parts = cid.split(":")
             if len(parts) < 3:
                 return
@@ -968,7 +973,6 @@ async def on_interaction(interaction: discord.Interaction):
         # Notify toggle
         # -----------------------
         if cid.startswith("notify:"):
-            # notify:{panel_id}:{page?}
             parts = cid.split(":")
             panel_id = int(parts[1])
             page = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else _panel_page_cache.get(panel_id, 0)
@@ -981,7 +985,9 @@ async def on_interaction(interaction: discord.Interaction):
             await interaction.response.defer(ephemeral=True)
 
             try:
-                pres = await db_to_thread(lambda: sb.table("panels").select("notify_enabled").eq("id", panel_id).limit(1).execute())
+                pres = await db_to_thread(
+                    lambda: sb.table("panels").select("notify_enabled").eq("id", panel_id).limit(1).execute()
+                )
                 if pres.data and "notify_enabled" in pres.data[0]:
                     cur = bool(pres.data[0]["notify_enabled"])
                     await db_to_thread(lambda: db_update_panel_safe(panel_id, {"notify_enabled": (not cur)}))
@@ -1003,7 +1009,6 @@ async def on_interaction(interaction: discord.Interaction):
         # Break toggle
         # -----------------------
         if cid.startswith("break:"):
-            # break:{panel_id}:{page?}
             parts = cid.split(":")
             panel_id = int(parts[1])
             page = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else _panel_page_cache.get(panel_id, 0)
@@ -1024,9 +1029,7 @@ async def on_interaction(interaction: discord.Interaction):
             await interaction.followup.send("休憩にする/解除する枠を選んでね👇", view=build_break_select_view(panel_id, slots, page), ephemeral=True)
             return
 
-        # break select
         if cid.startswith("breaksel:"):
-            # breaksel:{panel_id}:{page}
             parts = cid.split(":")
             panel_id = int(parts[1])
             page = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else _panel_page_cache.get(panel_id, 0)
@@ -1057,13 +1060,13 @@ async def on_interaction(interaction: discord.Interaction):
             await db_to_thread(lambda: db_update_slot_safe(slot_id, {"is_break": (not now_break)}))
             await interaction.followup.send(f"✅ {'休憩にした' if (not now_break) else '休憩解除した'}", ephemeral=True)
 
-            # 公開パネルを更新（ページ維持）
             await refresh_panel_message_by_panel_id(panel_id, interaction.guild, fallback_message=None, page=page)
             return
 
-        # delete
+        # -----------------------
+        # Delete
+        # -----------------------
         if cid.startswith("del:"):
-            # del:{panel_id}:{page?}
             parts = cid.split(":")
             panel_id = int(parts[1])
             page = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else _panel_page_cache.get(panel_id, 0)
@@ -1075,7 +1078,9 @@ async def on_interaction(interaction: discord.Interaction):
 
             await interaction.response.defer(ephemeral=True)
 
-            pres = await db_to_thread(lambda: sb.table("panels").select("guild_id,day_key").eq("id", panel_id).limit(1).execute())
+            pres = await db_to_thread(
+                lambda: sb.table("panels").select("guild_id,day_key").eq("id", panel_id).limit(1).execute()
+            )
             if not pres.data:
                 await interaction.followup.send("❌ panels が見つからない", ephemeral=True)
                 return
@@ -1101,6 +1106,7 @@ async def on_interaction(interaction: discord.Interaction):
             return
 
     except Exception as e:
+        print("❌ on_interaction error:", repr(e))
         try:
             if interaction.type == discord.InteractionType.component and not interaction.response.is_done():
                 await interaction.response.send_message(f"❌ エラー: {e}", ephemeral=True)
@@ -1113,6 +1119,7 @@ async def on_interaction(interaction: discord.Interaction):
 # =========================================================
 async def reminder_loop():
     await client.wait_until_ready()
+
     while not client.is_closed():
         try:
             now = datetime.now(UTC)
@@ -1126,7 +1133,8 @@ async def reminder_loop():
                 )
                 panels = pres.data or []
                 has_notify_col = True
-            except Exception:
+            except Exception as e:
+                print("[reminder_loop] panels 5cols error:", repr(e))
                 pres = await db_to_thread(
                     lambda: sb.table("panels")
                     .select("id,channel_id,notify_channel_id,interval_minutes")
@@ -1136,86 +1144,91 @@ async def reminder_loop():
                 has_notify_col = False
 
             for p in panels[:120]:
-                panel_id = int(p["id"])
-                notify_channel_id = p.get("notify_channel_id") or p.get("channel_id")
-                if not notify_channel_id:
-                    continue
-
-                interval = int(p.get("interval_minutes") or 30)
-
-                enabled = True
-                if has_notify_col and p.get("notify_enabled") is not None:
-                    enabled = bool(p["notify_enabled"])
-                else:
-                    enabled = bool(_notify_cache.get(panel_id, True))
-                if not enabled:
-                    continue
-
-                # ✅ ここが重要：reserved_by 条件を修正
-                sres = await db_to_thread(
-                    lambda: sb.table("slots")
-                    .select("id,start_at,end_at,reserved_by,notified,is_break")
-                    .eq("panel_id", panel_id)
-                    .not_.is_("reserved_by", "null")  # ✅ 修正点
-                    .eq("notified", False)
-                    .eq("is_break", False)
-                    .gte("start_at", now.isoformat())
-                    .lte("start_at", window_end.isoformat())
-                    .order("start_at")
-                    .execute()
-                )
-                slots = sres.data or []
-                if not slots:
-                    continue
-
-                used: set[int] = set()
-
-                for i, s in enumerate(slots):
-                    sid = int(s["id"])
-                    if sid in used:
+                try:
+                    panel_id = int(p["id"])
+                    notify_channel_id = p.get("notify_channel_id") or p.get("channel_id")
+                    if not notify_channel_id:
                         continue
 
-                    user_id = str(s["reserved_by"])
-                    st_dt = parse_iso(s["start_at"])
-                    en_dt = parse_iso(s["end_at"])
+                    interval = int(p.get("interval_minutes") or 30)
 
-                    group = [s]
-                    used.add(sid)
+                    if has_notify_col and p.get("notify_enabled") is not None:
+                        enabled = bool(p["notify_enabled"])
+                    else:
+                        enabled = bool(_notify_cache.get(panel_id, True))
+                    if not enabled:
+                        continue
 
-                    last_start = st_dt
-                    for t in slots[i + 1:]:
-                        if str(t.get("reserved_by")) != user_id:
-                            continue
-                        ts = parse_iso(t["start_at"])
-                        if ts == last_start + timedelta(minutes=interval):
-                            group.append(t)
-                            used.add(int(t["id"]))
-                            last_start = ts
-                            en_dt = parse_iso(t["end_at"])
+                    sres = await db_to_thread(
+                        lambda: sb.table("slots")
+                        .select("id,start_at,end_at,reserved_by,notified,is_break")
+                        .eq("panel_id", panel_id)
+                        .not_.is_("reserved_by", "null")
+                        .eq("notified", False)
+                        .eq("is_break", False)
+                        .gte("start_at", now.isoformat())
+                        .lte("start_at", window_end.isoformat())
+                        .order("start_at")
+                        .execute()
+                    )
+                    slots = sres.data or []
+                    if not slots:
+                        continue
+
+                    used: set[int] = set()
 
                     ch = client.get_channel(int(notify_channel_id))
                     if ch is None:
-                        try:
-                            ch = await client.fetch_channel(int(notify_channel_id))
-                        except Exception:
-                            ch = None
-                    if ch is None:
+                        print(f"[reminder_loop] channel not cached: {notify_channel_id}")
                         continue
 
-                    msg = f"⏰ {st_dt.astimezone(JST).strftime('%H:%M')}〜{en_dt.astimezone(JST).strftime('%H:%M')} の枠です <@{user_id}>"
-                    try:
-                        await ch.send(msg)
-                    except Exception:
-                        continue
+                    for i, s in enumerate(slots):
+                        sid = int(s["id"])
+                        if sid in used:
+                            continue
 
-                    for g in group:
+                        user_id = str(s["reserved_by"])
+                        st_dt = parse_iso(s["start_at"])
+                        en_dt = parse_iso(s["end_at"])
+
+                        group = [s]
+                        used.add(sid)
+
+                        last_start = st_dt
+                        for t in slots[i + 1:]:
+                            if str(t.get("reserved_by")) != user_id:
+                                continue
+                            ts = parse_iso(t["start_at"])
+                            if ts == last_start + timedelta(minutes=interval):
+                                group.append(t)
+                                used.add(int(t["id"]))
+                                last_start = ts
+                                en_dt = parse_iso(t["end_at"])
+
+                        msg = (
+                            f"⏰ {st_dt.astimezone(JST).strftime('%H:%M')}〜"
+                            f"{en_dt.astimezone(JST).strftime('%H:%M')} の枠です <@{user_id}>"
+                        )
+
                         try:
-                            await db_to_thread(lambda _id=int(g["id"]): db_update_slot_safe(_id, {"notified": True}))
-                        except Exception:
-                            pass
+                            await ch.send(msg)
+                        except Exception as e:
+                            print("[reminder_loop] send error:", repr(e))
+                            continue
 
-        except Exception:
-            pass
+                        for g in group:
+                            try:
+                                await db_to_thread(
+                                    lambda _id=int(g["id"]): db_update_slot_safe(_id, {"notified": True})
+                                )
+                            except Exception as e:
+                                print("[reminder_loop] notified update error:", repr(e))
+
+                except Exception as e:
+                    print("[reminder_loop] panel error:", repr(e))
+
+        except Exception as e:
+            print("[reminder_loop] outer error:", repr(e))
 
         await asyncio.sleep(60)
 
@@ -1235,29 +1248,11 @@ async def on_ready():
 
     print(f"✅ Logged in as {client.user}")
 
-    if not getattr(client, "_reminder_started", False):
-        client._reminder_started = True
-        asyncio.create_task(reminder_loop())
-
-
-async def run_bot():
-    backoff = 5
-    while True:
-        try:
-            await client.start(TOKEN)
-            return
-        except discord.HTTPException as e:
-            if getattr(e, "status", None) == 429:
-                print(f"⚠️ 429 Too Many Requests. sleep {backoff}s then retry...")
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 300)
-                continue
-            raise
-        except Exception as e:
-            print("❌ fatal error:", repr(e))
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 300)
+    task = getattr(client, "_reminder_task", None)
+    if task is None or task.done():
+        client._reminder_task = asyncio.create_task(reminder_loop())
+        print("✅ reminder_loop started")
 
 
 if __name__ == "__main__":
-    asyncio.run(run_bot())
+    client.run(TOKEN)
