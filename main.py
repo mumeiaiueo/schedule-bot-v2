@@ -1248,10 +1248,18 @@ async def on_ready():
 
     print(f"✅ Logged in as {client.user}")
 
+    try:
+        res = await db_to_thread(
+            lambda: sb.table("panels").select("id").limit(1).execute(),
+            "startup supabase ping"
+        )
+        print("✅ supabase ping ok", len(res.data or []))
+    except Exception as e:
+        print("❌ supabase ping failed:", repr(e))
+
     task = getattr(client, "_reminder_task", None)
     if task is None or task.done():
-        client._reminder_task = asyncio.create_task(reminder_loop())
-        print("✅ reminder_loop started")
+        print("⏸ reminder_loop stopped for debug")
 
 
 if __name__ == "__main__":
