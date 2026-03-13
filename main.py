@@ -1250,7 +1250,8 @@ async def on_ready():
 
     task = getattr(client, "_reminder_task", None)
     if task is None or task.done():
-        print("⏸ reminder_loop stopped for debug")
+        client._reminder_task = asyncio.create_task(reminder_loop())
+        print("✅ reminder_loop started")
 
 
 if __name__ == "__main__":
